@@ -400,7 +400,7 @@ app.add_middleware(
 try:
     from mcp.server.fastmcp import FastMCP as MCPServer
     
-    mcp_server = MCPServer("Chiran", stateless_http=True)
+    mcp_server = MCPServer("Chiran", stateless_http=True, json_response=True)
     
     @mcp_server.tool()
     async def generate_handoff(max_sessions: int = 3, include_code: bool = False) -> str:
