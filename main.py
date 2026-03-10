@@ -555,9 +555,9 @@ try:
         except Exception as e:
             return f"Error getting manifest: {e}"
 
-    # Mount MCP Streamable HTTP app at root (SDK adds /mcp internally)
-    app.mount("/", mcp_server.streamable_http_app())
-    print("🔌 MCP server mounted at / (SDK serves /mcp internally)")
+    # Mount MCP Streamable HTTP app (SDK adds /mcp internally)
+    app.mount("/mcp-server", mcp_server.streamable_http_app())
+    print("🔌 MCP server mounted at /mcp-server (endpoint: /mcp-server/mcp)")
 
 except ImportError:
     print("⚠️  mcp SDK not installed — MCP endpoint disabled. REST API still works.")
