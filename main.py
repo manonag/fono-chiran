@@ -357,13 +357,21 @@ class OpenQuestionOut(OpenQuestionCreate):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Startup: create pool + schema. Shutdown: close pool."""
+    """Startup: create pool + schema + MCP session manager. Shutdown: close pool."""
     global db_pool
     db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=2, max_size=10)
     async with db_pool.acquire() as conn:
         await conn.execute(SCHEMA_SQL)
     print(f"🧠 CHIRAN Context Service ready on port {PORT}")
-    yield
+    
+    # Start MCP session manager if available
+    try:
+        from mcp.server.fastmcp import FastMCP as _MCP
+        async with mcp_server.session_manager.run():
+            yield
+    except Exception:
+        yield
+    
     await db_pool.close()
 
 
@@ -383,33 +391,177 @@ app.add_middleware(
 
 
 # =============================================================================
-# MCP SERVER — Makes CHIRAN callable as a Claude tool (zero manual steps)
+# MCP SERVER — Official MCP SDK with Streamable HTTP transport
 # =============================================================================
-# This auto-discovers all FastAPI endpoints and exposes them as MCP tools.
-# Claude.ai, Claude Desktop, and Claude Code can all connect to /mcp
-# and invoke any CHIRAN endpoint directly.
+# Uses mcp.server.fastmcp.FastMCP with stateless_http=True
+# Claude.ai, Claude Desktop, and Claude Code connect to /mcp
+# Tools are explicitly defined (not auto-generated from REST endpoints)
 
 try:
-    from fastapi_mcp import FastApiMCP
+    from mcp.server.fastmcp import FastMCP as MCPServer
     
-    mcp = FastApiMCP(
-        app,
-        name="CHIRAN Context Service",
-        description=(
-            "Fono development context manager. Use get_handoff to load full project state. "
-            "Use create_session to save work at end of conversation. "
-            "Use create_decision to record technical decisions. "
-            "Use list_sprint to see current priorities. "
-            "Use list_questions to see unresolved questions. "
-            "ALWAYS call generate_handoff at the start of a conversation to load context."
-        ),
-    )
-    # Mount MCP server at /mcp on the same app
-    mcp.mount()
-    print("🔌 MCP server mounted at /mcp")
+    mcp_server = MCPServer("Chiran", stateless_http=True)
+    
+    @mcp_server.tool()
+    async def generate_handoff(max_sessions: int = 3, include_code: bool = False) -> str:
+        """Load full Fono project context. CALL THIS AT THE START OF EVERY CONVERSATION.
+        Returns deployment state, decisions, sprint priorities, recent sessions, open questions, and doc health."""
+        import urllib.request, urllib.error
+        try:
+            url = f"http://localhost:{PORT}/api/v1/context/handoff?max_sessions={max_sessions}&include_code={str(include_code).lower()}"
+            req = urllib.request.Request(url)
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                data = json.loads(resp.read().decode())
+                return data.get("handoff", "Error: no handoff content")
+        except Exception as e:
+            return f"Error generating handoff: {e}"
+    
+    @mcp_server.tool()
+    async def save_session(title: str, summary: str, next_actions: str = "[]", context_for_next: str = "", tools_used: str = "claude_chat", duration_mins: int = 60) -> str:
+        """Save a session summary at the END of every conversation. Records what was accomplished, next actions, and context for the next session."""
+        import urllib.request
+        try:
+            body = json.dumps({
+                "title": title, "summary": summary,
+                "next_actions": json.loads(next_actions) if next_actions.startswith("[") else [{"action": next_actions}],
+                "context_for_next": context_for_next,
+                "tools_used": [t.strip() for t in tools_used.split(",")],
+                "duration_mins": duration_mins,
+            }).encode()
+            req = urllib.request.Request(f"http://localhost:{PORT}/api/v1/sessions", data=body, headers={"Content-Type": "application/json"}, method="POST")
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                data = json.loads(resp.read().decode())
+                return f"Session #{data.get('session_number', '?')} saved: {title}"
+        except Exception as e:
+            return f"Error saving session: {e}"
+    
+    @mcp_server.tool()
+    async def record_decision(title: str, decision: str, reasoning: str, category: str = "technical", alternatives: str = "[]") -> str:
+        """Record a technical or strategic decision with reasoning and rejected alternatives. Prevents Claude from re-suggesting rejected ideas in future sessions."""
+        import urllib.request
+        try:
+            body = json.dumps({
+                "title": title, "category": category, "decision": decision,
+                "reasoning": reasoning,
+                "alternatives": json.loads(alternatives) if alternatives.startswith("[") else [],
+            }).encode()
+            req = urllib.request.Request(f"http://localhost:{PORT}/api/v1/decisions", data=body, headers={"Content-Type": "application/json"}, method="POST")
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                return f"Decision recorded: {title}"
+        except Exception as e:
+            return f"Error recording decision: {e}"
+    
+    @mcp_server.tool()
+    async def list_decisions(status: str = "active") -> str:
+        """List all active decisions. Check this before suggesting any technical approach to avoid re-suggesting rejected ideas."""
+        import urllib.request
+        try:
+            with urllib.request.urlopen(f"http://localhost:{PORT}/api/v1/decisions?status={status}", timeout=10) as resp:
+                decisions = json.loads(resp.read().decode())
+                if not decisions:
+                    return "No active decisions recorded."
+                lines = []
+                for d in decisions:
+                    lines.append(f"- {d['title']}: {d['decision']} (Why: {d['reasoning']})")
+                return "\n".join(lines)
+        except Exception as e:
+            return f"Error listing decisions: {e}"
+    
+    @mcp_server.tool()
+    async def list_sprint(status: str = "") -> str:
+        """List current sprint items and priorities. Shows what to work on next."""
+        import urllib.request
+        try:
+            url = f"http://localhost:{PORT}/api/v1/sprint"
+            if status:
+                url += f"?status={status}"
+            with urllib.request.urlopen(url, timeout=10) as resp:
+                items = json.loads(resp.read().decode())
+                if not items:
+                    return "No active sprint items."
+                prio_map = {1: "CRITICAL", 2: "HIGH", 3: "MEDIUM", 4: "LOW"}
+                lines = []
+                for s in items:
+                    blocker = f" ⚠️ BLOCKED: {s['blocker']}" if s.get('blocker') else ""
+                    lines.append(f"[{s['status']}] {prio_map.get(s['priority'], '?')}: {s['title']}{blocker}")
+                return "\n".join(lines)
+        except Exception as e:
+            return f"Error listing sprint: {e}"
+    
+    @mcp_server.tool()
+    async def list_deployments() -> str:
+        """List all deployment states — what's live, in progress, or planned."""
+        import urllib.request
+        try:
+            with urllib.request.urlopen(f"http://localhost:{PORT}/api/v1/deployments", timeout=10) as resp:
+                deps = json.loads(resp.read().decode())
+                if not deps:
+                    return "No deployments recorded."
+                lines = []
+                for d in deps:
+                    lines.append(f"{'✅' if d['status']=='deployed' else '📋'} {d['component']} [{d['status']}] {d.get('version', '')}")
+                return "\n".join(lines)
+        except Exception as e:
+            return f"Error listing deployments: {e}"
+    
+    @mcp_server.tool()
+    async def list_open_questions() -> str:
+        """List unresolved questions. Check this before making assumptions."""
+        import urllib.request
+        try:
+            with urllib.request.urlopen(f"http://localhost:{PORT}/api/v1/questions?status=open", timeout=10) as resp:
+                questions = json.loads(resp.read().decode())
+                if not questions:
+                    return "No open questions."
+                lines = []
+                for q in questions:
+                    lines.append(f"? {q['question']}")
+                    if q.get('context'):
+                        lines.append(f"  Context: {q['context']}")
+                return "\n".join(lines)
+        except Exception as e:
+            return f"Error listing questions: {e}"
+    
+    @mcp_server.tool()
+    async def search_docs(query: str) -> str:
+        """Search the document knowledge graph. Find which architecture docs mention a specific topic."""
+        import urllib.request, urllib.parse
+        try:
+            encoded = urllib.parse.quote(query)
+            with urllib.request.urlopen(f"http://localhost:{PORT}/api/v1/docs/search?q={encoded}", timeout=10) as resp:
+                data = json.loads(resp.read().decode())
+                results = data.get("results", [])
+                if not results:
+                    return f"No documents found matching '{query}'."
+                lines = [f"Found {len(results)} results for '{query}':"]
+                for r in results:
+                    lines.append(f"- [{r['doc_id']}] {r['name']} ({r['type']})")
+                return "\n".join(lines)
+        except Exception as e:
+            return f"Error searching docs: {e}"
+    
+    @mcp_server.tool()
+    async def get_doc_manifest() -> str:
+        """Get the live document manifest — all architecture docs, their versions, and status."""
+        import urllib.request
+        try:
+            with urllib.request.urlopen(f"http://localhost:{PORT}/api/v1/docs/manifest", timeout=10) as resp:
+                data = json.loads(resp.read().decode())
+                docs = data.get("documents", [])
+                lines = [f"Document Manifest ({len(docs)} documents):"]
+                for d in docs:
+                    lines.append(f"- {d['doc_id']}: {d['name']} [v{d.get('version', '?')}] ({d.get('status', '?')})")
+                return "\n".join(lines)
+        except Exception as e:
+            return f"Error getting manifest: {e}"
+
+    # Mount MCP Streamable HTTP app at /mcp
+    app.mount("/mcp", mcp_server.streamable_http_app())
+    print("🔌 MCP server mounted at /mcp (Streamable HTTP)")
+
 except ImportError:
-    print("⚠️  fastapi-mcp not installed — MCP endpoint disabled. REST API still works.")
-    print("   Install with: pip install fastapi-mcp")
+    print("⚠️  mcp SDK not installed — MCP endpoint disabled. REST API still works.")
+    print("   Install with: pip install mcp")
 
 
 # =============================================================================
