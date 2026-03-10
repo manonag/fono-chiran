@@ -481,165 +481,218 @@ app.add_middleware(
 # =============================================================================
 # MCP SERVER — Official MCP SDK with Streamable HTTP transport
 # =============================================================================
-# Uses mcp.server.fastmcp.FastMCP with stateless_http=True
-# Claude.ai, Claude Desktop, and Claude Code connect to /mcp
-# Tools are explicitly defined (not auto-generated from REST endpoints)
+# Tools query the database directly (no localhost HTTP self-calls)
+# This avoids async deadlocks and is faster
 
 try:
     from mcp.server.fastmcp import FastMCP as MCPServer
     
     mcp_server = MCPServer("Chiran", stateless_http=True)
     
+    async def _get_pool():
+        """Get the database pool, raising a clear error if not ready."""
+        if db_pool is None:
+            raise RuntimeError("Database pool not initialized")
+        return db_pool
+    
     @mcp_server.tool()
     async def generate_handoff(max_sessions: int = 3, include_code: bool = False) -> str:
         """Load full Fono project context. CALL THIS AT THE START OF EVERY CONVERSATION.
         Returns deployment state, decisions, sprint priorities, recent sessions, open questions, and doc health."""
-        import urllib.request, urllib.error
         try:
-            url = f"http://localhost:{PORT}/api/v1/context/handoff?max_sessions={max_sessions}&include_code={str(include_code).lower()}"
-            req = urllib.request.Request(url)
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                data = json.loads(resp.read().decode())
-                return data.get("handoff", "Error: no handoff content")
+            pool = await _get_pool()
+            deployments = await pool.fetch(
+                "SELECT component, status, environment, version, details, deployed_at "
+                "FROM deployment_state ORDER BY component"
+            )
+            decisions = await pool.fetch(
+                "SELECT title, category, decision, reasoning, alternatives, status "
+                "FROM decisions WHERE status = 'active' ORDER BY decided_at DESC"
+            )
+            sprint = await pool.fetch(
+                "SELECT title, description, priority, status, blocker "
+                "FROM sprint_items WHERE status IN ('todo', 'in_progress', 'blocked') "
+                "ORDER BY priority, created_at"
+            )
+            sessions = await pool.fetch(
+                "SELECT session_number, title, summary, key_outputs, next_actions, "
+                "context_for_next, problems_hit, started_at "
+                "FROM sessions ORDER BY started_at DESC LIMIT $1",
+                max_sessions
+            )
+            questions = await pool.fetch(
+                "SELECT question, context, category "
+                "FROM open_questions WHERE status = 'open' ORDER BY created_at"
+            )
+            code_map = []
+            if include_code:
+                code_map = await pool.fetch(
+                    "SELECT file_path, purpose, status, notes "
+                    "FROM code_state WHERE status = 'active' ORDER BY file_path"
+                )
+            doc_staleness = await pool.fetch(
+                "SELECT doc_id, issue, severity FROM doc_staleness WHERE status = 'open' ORDER BY severity DESC LIMIT 10"
+            )
+            doc_count = await pool.fetchval(
+                "SELECT count(*) FROM doc_nodes WHERE type = 'document' AND status = 'current'"
+            )
+            cost_total = await pool.fetchval(
+                "SELECT COALESCE(SUM(cost_usd), 0) FROM cost_events WHERE created_at > now() - interval '7 days'"
+            )
+            handoff = _build_handoff_document(
+                deployments, decisions, sprint, sessions, questions, code_map,
+                doc_staleness, doc_count, float(cost_total),
+            )
+            return handoff
         except Exception as e:
             return f"Error generating handoff: {e}"
     
     @mcp_server.tool()
     async def save_session(title: str, summary: str, next_actions: str = "[]", context_for_next: str = "", tools_used: str = "claude_chat", duration_mins: int = 60) -> str:
         """Save a session summary at the END of every conversation. Records what was accomplished, next actions, and context for the next session."""
-        import urllib.request
         try:
-            body = json.dumps({
-                "title": title, "summary": summary,
-                "next_actions": json.loads(next_actions) if next_actions.startswith("[") else [{"action": next_actions}],
-                "context_for_next": context_for_next,
-                "tools_used": [t.strip() for t in tools_used.split(",")],
-                "duration_mins": duration_mins,
-            }).encode()
-            req = urllib.request.Request(f"http://localhost:{PORT}/api/v1/sessions", data=body, headers={"Content-Type": "application/json"}, method="POST")
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                data = json.loads(resp.read().decode())
-                return f"Session #{data.get('session_number', '?')} saved: {title}"
+            pool = await _get_pool()
+            parsed_actions = json.loads(next_actions) if next_actions.startswith("[") else [{"action": next_actions}]
+            parsed_tools = [t.strip() for t in tools_used.split(",")]
+            row = await pool.fetchrow("""
+                INSERT INTO sessions (
+                    title, summary, key_outputs, decisions_made, problems_hit,
+                    next_actions, context_for_next, tools_used, duration_mins, ended_at
+                ) VALUES ($1, $2, '[]'::jsonb, '{}', '[]'::jsonb, $3::jsonb, $4, $5, $6, now())
+                RETURNING session_number
+            """, title, summary, json.dumps(parsed_actions), context_for_next,
+                parsed_tools, duration_mins)
+            return f"Session #{row['session_number']} saved: {title}"
         except Exception as e:
             return f"Error saving session: {e}"
     
     @mcp_server.tool()
     async def record_decision(title: str, decision: str, reasoning: str, category: str = "technical", alternatives: str = "[]") -> str:
         """Record a technical or strategic decision with reasoning and rejected alternatives. Prevents Claude from re-suggesting rejected ideas in future sessions."""
-        import urllib.request
         try:
-            body = json.dumps({
-                "title": title, "category": category, "decision": decision,
-                "reasoning": reasoning,
-                "alternatives": json.loads(alternatives) if alternatives.startswith("[") else [],
-            }).encode()
-            req = urllib.request.Request(f"http://localhost:{PORT}/api/v1/decisions", data=body, headers={"Content-Type": "application/json"}, method="POST")
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                return f"Decision recorded: {title}"
+            pool = await _get_pool()
+            parsed_alts = json.loads(alternatives) if alternatives.startswith("[") else []
+            await pool.execute("""
+                INSERT INTO decisions (title, category, decision, reasoning, alternatives, status)
+                VALUES ($1, $2, $3, $4, $5::jsonb, 'active')
+            """, title, category, decision, reasoning, json.dumps(parsed_alts))
+            return f"Decision recorded: {title}"
         except Exception as e:
             return f"Error recording decision: {e}"
     
     @mcp_server.tool()
     async def list_decisions(status: str = "active") -> str:
         """List all active decisions. Check this before suggesting any technical approach to avoid re-suggesting rejected ideas."""
-        import urllib.request
         try:
-            with urllib.request.urlopen(f"http://localhost:{PORT}/api/v1/decisions?status={status}", timeout=10) as resp:
-                decisions = json.loads(resp.read().decode())
-                if not decisions:
-                    return "No active decisions recorded."
-                lines = []
-                for d in decisions:
-                    lines.append(f"- {d['title']}: {d['decision']} (Why: {d['reasoning']})")
-                return "\n".join(lines)
+            pool = await _get_pool()
+            rows = await pool.fetch(
+                "SELECT title, decision, reasoning FROM decisions WHERE status = $1 ORDER BY decided_at DESC",
+                status
+            )
+            if not rows:
+                return "No active decisions recorded."
+            lines = []
+            for d in rows:
+                lines.append(f"- {d['title']}: {d['decision']} (Why: {d['reasoning']})")
+            return "\n".join(lines)
         except Exception as e:
             return f"Error listing decisions: {e}"
     
     @mcp_server.tool()
     async def list_sprint(status: str = "") -> str:
         """List current sprint items and priorities. Shows what to work on next."""
-        import urllib.request
         try:
-            url = f"http://localhost:{PORT}/api/v1/sprint"
+            pool = await _get_pool()
             if status:
-                url += f"?status={status}"
-            with urllib.request.urlopen(url, timeout=10) as resp:
-                items = json.loads(resp.read().decode())
-                if not items:
-                    return "No active sprint items."
-                prio_map = {1: "CRITICAL", 2: "HIGH", 3: "MEDIUM", 4: "LOW"}
-                lines = []
-                for s in items:
-                    blocker = f" ⚠️ BLOCKED: {s['blocker']}" if s.get('blocker') else ""
-                    lines.append(f"[{s['status']}] {prio_map.get(s['priority'], '?')}: {s['title']}{blocker}")
-                return "\n".join(lines)
+                rows = await pool.fetch(
+                    "SELECT title, priority, status, blocker FROM sprint_items WHERE status = $1 ORDER BY priority, created_at",
+                    status
+                )
+            else:
+                rows = await pool.fetch(
+                    "SELECT title, priority, status, blocker FROM sprint_items "
+                    "WHERE status IN ('todo','in_progress','blocked') ORDER BY priority, created_at"
+                )
+            if not rows:
+                return "No active sprint items."
+            prio_map = {1: "CRITICAL", 2: "HIGH", 3: "MEDIUM", 4: "LOW"}
+            lines = []
+            for s in rows:
+                blocker = f" ⚠️ BLOCKED: {s['blocker']}" if s.get('blocker') else ""
+                lines.append(f"[{s['status']}] {prio_map.get(s['priority'], '?')}: {s['title']}{blocker}")
+            return "\n".join(lines)
         except Exception as e:
             return f"Error listing sprint: {e}"
     
     @mcp_server.tool()
     async def list_deployments() -> str:
         """List all deployment states — what's live, in progress, or planned."""
-        import urllib.request
         try:
-            with urllib.request.urlopen(f"http://localhost:{PORT}/api/v1/deployments", timeout=10) as resp:
-                deps = json.loads(resp.read().decode())
-                if not deps:
-                    return "No deployments recorded."
-                lines = []
-                for d in deps:
-                    lines.append(f"{'✅' if d['status']=='deployed' else '📋'} {d['component']} [{d['status']}] {d.get('version', '')}")
-                return "\n".join(lines)
+            pool = await _get_pool()
+            rows = await pool.fetch("SELECT component, status, version FROM deployment_state ORDER BY component")
+            if not rows:
+                return "No deployments recorded."
+            lines = []
+            for d in rows:
+                lines.append(f"{'✅' if d['status']=='deployed' else '📋'} {d['component']} [{d['status']}] {d['version'] or ''}")
+            return "\n".join(lines)
         except Exception as e:
             return f"Error listing deployments: {e}"
     
     @mcp_server.tool()
     async def list_open_questions() -> str:
         """List unresolved questions. Check this before making assumptions."""
-        import urllib.request
         try:
-            with urllib.request.urlopen(f"http://localhost:{PORT}/api/v1/questions?status=open", timeout=10) as resp:
-                questions = json.loads(resp.read().decode())
-                if not questions:
-                    return "No open questions."
-                lines = []
-                for q in questions:
-                    lines.append(f"? {q['question']}")
-                    if q.get('context'):
-                        lines.append(f"  Context: {q['context']}")
-                return "\n".join(lines)
+            pool = await _get_pool()
+            rows = await pool.fetch(
+                "SELECT question, context FROM open_questions WHERE status = 'open' ORDER BY created_at"
+            )
+            if not rows:
+                return "No open questions."
+            lines = []
+            for q in rows:
+                lines.append(f"? {q['question']}")
+                if q.get('context'):
+                    lines.append(f"  Context: {q['context']}")
+            return "\n".join(lines)
         except Exception as e:
             return f"Error listing questions: {e}"
     
     @mcp_server.tool()
     async def search_docs(query: str) -> str:
         """Search the document knowledge graph. Find which architecture docs mention a specific topic."""
-        import urllib.request, urllib.parse
         try:
-            encoded = urllib.parse.quote(query)
-            with urllib.request.urlopen(f"http://localhost:{PORT}/api/v1/docs/search?q={encoded}", timeout=10) as resp:
-                data = json.loads(resp.read().decode())
-                results = data.get("results", [])
-                if not results:
-                    return f"No documents found matching '{query}'."
-                lines = [f"Found {len(results)} results for '{query}':"]
-                for r in results:
-                    lines.append(f"- [{r['doc_id']}] {r['name']} ({r['type']})")
-                return "\n".join(lines)
+            pool = await _get_pool()
+            rows = await pool.fetch("""
+                SELECT doc_id, name, type FROM doc_nodes
+                WHERE status = 'current'
+                  AND (name ILIKE '%' || $1 || '%' OR doc_id ILIKE '%' || $1 || '%'
+                       OR content::text ILIKE '%' || $1 || '%')
+                ORDER BY CASE WHEN name ILIKE '%' || $1 || '%' THEN 0 ELSE 1 END, doc_id
+                LIMIT 20
+            """, query)
+            if not rows:
+                return f"No documents found matching '{query}'."
+            lines = [f"Found {len(rows)} results for '{query}':"]
+            for r in rows:
+                lines.append(f"- [{r['doc_id']}] {r['name']} ({r['type']})")
+            return "\n".join(lines)
         except Exception as e:
             return f"Error searching docs: {e}"
     
     @mcp_server.tool()
     async def get_doc_manifest() -> str:
         """Get the live document manifest — all architecture docs, their versions, and status."""
-        import urllib.request
         try:
-            with urllib.request.urlopen(f"http://localhost:{PORT}/api/v1/docs/manifest", timeout=10) as resp:
-                data = json.loads(resp.read().decode())
-                docs = data.get("documents", [])
-                lines = [f"Document Manifest ({len(docs)} documents):"]
-                for d in docs:
-                    lines.append(f"- {d['doc_id']}: {d['name']} [v{d.get('version', '?')}] ({d.get('status', '?')})")
-                return "\n".join(lines)
+            pool = await _get_pool()
+            rows = await pool.fetch("""
+                SELECT doc_id, name, version, status
+                FROM doc_nodes WHERE type = 'document' ORDER BY doc_id
+            """)
+            lines = [f"Document Manifest ({len(rows)} documents):"]
+            for d in rows:
+                lines.append(f"- {d['doc_id']}: {d['name']} [v{d.get('version', '?')}] ({d.get('status', '?')})")
+            return "\n".join(lines)
         except Exception as e:
             return f"Error getting manifest: {e}"
 
