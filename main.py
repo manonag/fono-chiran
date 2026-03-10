@@ -643,9 +643,12 @@ try:
         except Exception as e:
             return f"Error getting manifest: {e}"
 
-    # Mount MCP Streamable HTTP app at /mcp
-    app.mount("/mcp", mcp_server.streamable_http_app())
-    print("🔌 MCP server mounted at /mcp (Streamable HTTP)")
+    # Mount MCP Streamable HTTP app
+    # FastMCP's streamable_http_app() creates routes at /mcp internally
+    # Mounting at /mcp-server makes the endpoint /mcp-server/mcp
+    # which matches the Claude.ai connector URL
+    app.mount("/mcp-server", mcp_server.streamable_http_app())
+    print("🔌 MCP server mounted at /mcp-server (Streamable HTTP, endpoint: /mcp-server/mcp)")
 
 except ImportError:
     print("⚠️  mcp SDK not installed — MCP endpoint disabled. REST API still works.")
