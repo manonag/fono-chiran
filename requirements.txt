@@ -1,0 +1,9 @@
+# CHIRAN Context Service Dependencies
+# Matches Fono's existing stack (FastAPI + asyncpg)
+# MCP layer auto-exposes all endpoints as Claude tools
+
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.0
+asyncpg>=0.30.0
+pydantic>=2.0.0
+fastapi-mcp>=0.4.0
