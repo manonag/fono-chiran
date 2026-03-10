@@ -40,7 +40,8 @@ from contextlib import asynccontextmanager
 import asyncpg
 from fastapi import FastAPI, HTTPException, Depends, Query
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator, ConfigDict
+from uuid import UUID as _UUID
 
 
 # =============================================================================
@@ -249,6 +250,35 @@ CREATE INDEX IF NOT EXISTS idx_cost_events_division ON cost_events(division);
 # PYDANTIC MODELS
 # =============================================================================
 
+# --- Helpers for Postgres → Pydantic type conversion ---
+def _to_str(v):
+    """Convert UUID objects (or any value) to string."""
+    if v is None:
+        return v
+    return str(v)
+
+def _to_list(v):
+    """Convert JSON text strings from Postgres to Python lists."""
+    if isinstance(v, str):
+        try:
+            return json.loads(v)
+        except (json.JSONDecodeError, TypeError):
+            return []
+    if v is None:
+        return []
+    return v
+
+def _to_dict(v):
+    """Convert JSON text strings from Postgres to Python dicts."""
+    if isinstance(v, str):
+        try:
+            return json.loads(v)
+        except (json.JSONDecodeError, TypeError):
+            return {}
+    if v is None:
+        return {}
+    return v
+
 # --- Deployment State ---
 class DeploymentStatus(str, Enum):
     planned = "planned"
@@ -264,9 +294,20 @@ class DeploymentCreate(BaseModel):
     details: dict = Field(default_factory=dict)
 
 class DeploymentOut(DeploymentCreate):
+    model_config = ConfigDict(from_attributes=True)
     id: str
     deployed_at: datetime | None = None
     updated_at: datetime
+
+    @field_validator('id', mode='before')
+    @classmethod
+    def _fix_id(cls, v):
+        return _to_str(v)
+
+    @field_validator('details', mode='before')
+    @classmethod
+    def _fix_details(cls, v):
+        return _to_dict(v)
 
 # --- Decisions ---
 class DecisionCreate(BaseModel):
@@ -282,9 +323,20 @@ class DecisionCreate(BaseModel):
     revisit_after: datetime | None = None
 
 class DecisionOut(DecisionCreate):
+    model_config = ConfigDict(from_attributes=True)
     id: str
     session_id: str | None = None
     decided_at: datetime
+
+    @field_validator('id', 'session_id', mode='before')
+    @classmethod
+    def _fix_ids(cls, v):
+        return _to_str(v)
+
+    @field_validator('alternatives', mode='before')
+    @classmethod
+    def _fix_alternatives(cls, v):
+        return _to_list(v)
 
 # --- Sprint Items ---
 class SprintItemCreate(BaseModel):
@@ -300,10 +352,16 @@ class SprintItemUpdate(BaseModel):
     priority: int | None = None
 
 class SprintItemOut(SprintItemCreate):
+    model_config = ConfigDict(from_attributes=True)
     id: str
     created_at: datetime
     updated_at: datetime
     completed_at: datetime | None = None
+
+    @field_validator('id', mode='before')
+    @classmethod
+    def _fix_id(cls, v):
+        return _to_str(v)
 
 # --- Sessions ---
 class SessionCreate(BaseModel):
@@ -318,10 +376,28 @@ class SessionCreate(BaseModel):
     duration_mins: int | None = None
 
 class SessionOut(SessionCreate):
+    model_config = ConfigDict(from_attributes=True)
     id: str
     session_number: int
     started_at: datetime
     ended_at: datetime | None = None
+
+    @field_validator('id', mode='before')
+    @classmethod
+    def _fix_id(cls, v):
+        return _to_str(v)
+
+    @field_validator('key_outputs', 'problems_hit', 'next_actions', mode='before')
+    @classmethod
+    def _fix_json_lists(cls, v):
+        return _to_list(v)
+
+    @field_validator('decisions_made', 'tools_used', mode='before')
+    @classmethod
+    def _fix_arrays(cls, v):
+        if v is None:
+            return []
+        return v
 
 # --- Code State ---
 class CodeStateCreate(BaseModel):
@@ -331,8 +407,14 @@ class CodeStateCreate(BaseModel):
     notes: str | None = None
 
 class CodeStateOut(CodeStateCreate):
+    model_config = ConfigDict(from_attributes=True)
     id: str
     last_modified: datetime
+
+    @field_validator('id', mode='before')
+    @classmethod
+    def _fix_id(cls, v):
+        return _to_str(v)
 
 # --- Open Questions ---
 class OpenQuestionCreate(BaseModel):
@@ -344,11 +426,17 @@ class OpenQuestionResolve(BaseModel):
     answer: str
 
 class OpenQuestionOut(OpenQuestionCreate):
+    model_config = ConfigDict(from_attributes=True)
     id: str
     status: str
     answer: str | None = None
     created_at: datetime
     resolved_at: datetime | None = None
+
+    @field_validator('id', mode='before')
+    @classmethod
+    def _fix_id(cls, v):
+        return _to_str(v)
 
 
 # =============================================================================
@@ -400,7 +488,7 @@ app.add_middleware(
 try:
     from mcp.server.fastmcp import FastMCP as MCPServer
     
-    mcp_server = MCPServer("Chiran", stateless_http=True, json_response=True, host="0.0.0.0")
+    mcp_server = MCPServer("Chiran", stateless_http=True)
     
     @mcp_server.tool()
     async def generate_handoff(max_sessions: int = 3, include_code: bool = False) -> str:
@@ -555,9 +643,9 @@ try:
         except Exception as e:
             return f"Error getting manifest: {e}"
 
-    # Mount MCP Streamable HTTP app (SDK adds /mcp internally)
-    app.mount("/mcp-server", mcp_server.streamable_http_app())
-    print("🔌 MCP server mounted at /mcp-server (endpoint: /mcp-server/mcp)")
+    # Mount MCP Streamable HTTP app at /mcp
+    app.mount("/mcp", mcp_server.streamable_http_app())
+    print("🔌 MCP server mounted at /mcp (Streamable HTTP)")
 
 except ImportError:
     print("⚠️  mcp SDK not installed — MCP endpoint disabled. REST API still works.")
@@ -1118,11 +1206,22 @@ class DocNodeCreate(BaseModel):
     status: str = Field(default="current")
 
 class DocNodeOut(DocNodeCreate):
+    model_config = ConfigDict(from_attributes=True)
     id: str
     version: int
     updated_by: str
     created_at: datetime
     updated_at: datetime
+
+    @field_validator('id', mode='before')
+    @classmethod
+    def _fix_id(cls, v):
+        return _to_str(v)
+
+    @field_validator('content', 'metadata', mode='before')
+    @classmethod
+    def _fix_json_dicts(cls, v):
+        return _to_dict(v)
 
 class DocEdgeCreate(BaseModel):
     from_node_id: str
@@ -1130,12 +1229,18 @@ class DocEdgeCreate(BaseModel):
     relation: str = Field(..., examples=["depends_on", "supersedes", "contains", "references"])
 
 class DocStalenessOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
     id: str
     doc_id: str
     issue: str
     severity: str
     status: str
     detected_at: datetime
+
+    @field_validator('id', mode='before')
+    @classmethod
+    def _fix_id(cls, v):
+        return _to_str(v)
 
 class DocSearchResult(BaseModel):
     doc_id: str
