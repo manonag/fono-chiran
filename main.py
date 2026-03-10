@@ -486,8 +486,15 @@ app.add_middleware(
 
 try:
     from mcp.server.fastmcp import FastMCP as MCPServer
+    from mcp.server.transport_security import TransportSecuritySettings
     
-    mcp_server = MCPServer("Chiran", stateless_http=True)
+    mcp_server = MCPServer(
+        "Chiran",
+        stateless_http=True,
+        transport_security=TransportSecuritySettings(
+            enable_dns_rebinding_protection=False,
+        ),
+    )
     
     async def _get_pool():
         """Get the database pool, raising a clear error if not ready."""
