@@ -71,50 +71,74 @@ async def get_db() -> asyncpg.Pool:
 
 SCHEMA_SQL = """
 -- ============================================================
--- CHIRAN Context Service Schema
--- Designed for Fono development continuity
+-- CHIRAN Context Service Schema — Multi-Project
+-- Supports multiple products: Fono, SalesPilot, future projects
 -- ============================================================
+
+-- 0. PROJECTS: Registry of all products CHIRAN manages
+CREATE TABLE IF NOT EXISTS projects (
+    id              TEXT PRIMARY KEY,            -- 'fono', 'salespilot'
+    name            TEXT NOT NULL,               -- 'Fono', 'SalesPilot'
+    description     TEXT,
+    status          TEXT DEFAULT 'active',       -- active | paused | archived
+    metadata        JSONB DEFAULT '{}',          -- tech stack, repo URLs, etc.
+    created_at      TIMESTAMPTZ DEFAULT now()
+);
+
+-- Seed default projects if not exist
+INSERT INTO projects (id, name, description, metadata) VALUES
+    ('fono', 'Fono', 'AI Voice Assistant for South Indian Telugu restaurants in California',
+     '{"repo": "manonag/fono-backend", "frontend": "manonag/fono-frontend", "stack": "FastAPI + PostgreSQL + Twilio + Railway"}'::jsonb),
+    ('salespilot', 'SalesPilot', 'Field sales route optimization with ML-predicted deal priority scoring',
+     '{"repo": "planned", "stack": "FastAPI + PostgreSQL + XGBoost + OR-Tools", "context": "Kanaka SJSU DL project"}'::jsonb),
+    ('platform', 'Platform', 'Shared infrastructure across all products — CHIRAN, IAD, agent architecture',
+     '{"scope": "chiran, iad-governance, agent-platform, shared-sdlc"}'::jsonb)
+ON CONFLICT (id) DO NOTHING;
 
 -- 1. DEPLOYMENT STATE: What's actually running in production
 CREATE TABLE IF NOT EXISTS deployment_state (
     id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    component       TEXT NOT NULL,           -- e.g. 'data-collection-pipeline', 'api-service'
-    status          TEXT NOT NULL DEFAULT 'planned',  -- planned | in_progress | deployed | deprecated
-    environment     TEXT NOT NULL DEFAULT 'production', -- production | staging | local
-    version         TEXT,                    -- e.g. 'phase0-step2', 'v0.1.0'
-    details         JSONB NOT NULL DEFAULT '{}',  -- flexible metadata
+    project         TEXT NOT NULL DEFAULT 'fono' REFERENCES projects(id),
+    component       TEXT NOT NULL,
+    status          TEXT NOT NULL DEFAULT 'planned',
+    environment     TEXT NOT NULL DEFAULT 'production',
+    version         TEXT,
+    details         JSONB NOT NULL DEFAULT '{}',
     deployed_at     TIMESTAMPTZ,
     updated_at      TIMESTAMPTZ DEFAULT now(),
-    UNIQUE(component, environment)
+    UNIQUE(project, component, environment)
 );
 
 -- 2. DECISIONS: What was decided and WHY
 CREATE TABLE IF NOT EXISTS decisions (
     id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    title           TEXT NOT NULL,           -- e.g. 'FastAPI over OpenClaw'
-    category        TEXT NOT NULL DEFAULT 'technical', -- technical | architectural | strategic | provider
-    decision        TEXT NOT NULL,           -- what was decided
-    reasoning       TEXT NOT NULL,           -- WHY (this is the critical part)
-    alternatives    JSONB DEFAULT '[]',      -- what was considered and rejected
-    status          TEXT NOT NULL DEFAULT 'active', -- active | superseded | revisit
-    session_id      UUID,                    -- which session this came from
+    project         TEXT NOT NULL DEFAULT 'fono' REFERENCES projects(id),
+    title           TEXT NOT NULL,
+    category        TEXT NOT NULL DEFAULT 'technical',
+    decision        TEXT NOT NULL,
+    reasoning       TEXT NOT NULL,
+    alternatives    JSONB DEFAULT '[]',
+    status          TEXT NOT NULL DEFAULT 'active',
+    session_id      UUID,
     decided_at      TIMESTAMPTZ DEFAULT now(),
-    revisit_after   TIMESTAMPTZ              -- optional: when to re-evaluate
+    revisit_after   TIMESTAMPTZ
 );
 
 CREATE INDEX IF NOT EXISTS idx_decisions_category ON decisions(category);
 CREATE INDEX IF NOT EXISTS idx_decisions_status ON decisions(status);
+CREATE INDEX IF NOT EXISTS idx_decisions_project ON decisions(project);
 
 -- 3. SPRINT STATE: Current priorities and blockers
 CREATE TABLE IF NOT EXISTS sprint_items (
     id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    project         TEXT NOT NULL DEFAULT 'fono' REFERENCES projects(id),
     title           TEXT NOT NULL,
     description     TEXT,
-    priority        INTEGER NOT NULL DEFAULT 3,  -- 1=critical, 2=high, 3=medium, 4=low
-    status          TEXT NOT NULL DEFAULT 'todo', -- todo | in_progress | blocked | done | cancelled
-    blocker         TEXT,                    -- what's blocking this
-    depends_on      UUID[],                 -- other sprint_item IDs
-    session_id      UUID,                   -- which session created/updated this
+    priority        INTEGER NOT NULL DEFAULT 3,
+    status          TEXT NOT NULL DEFAULT 'todo',
+    blocker         TEXT,
+    depends_on      UUID[],
+    session_id      UUID,
     created_at      TIMESTAMPTZ DEFAULT now(),
     updated_at      TIMESTAMPTZ DEFAULT now(),
     completed_at    TIMESTAMPTZ
@@ -122,68 +146,77 @@ CREATE TABLE IF NOT EXISTS sprint_items (
 
 CREATE INDEX IF NOT EXISTS idx_sprint_status ON sprint_items(status);
 CREATE INDEX IF NOT EXISTS idx_sprint_priority ON sprint_items(priority);
+CREATE INDEX IF NOT EXISTS idx_sprint_project ON sprint_items(project);
 
 -- 4. SESSION HISTORY: Compressed summaries of every Claude work session
 CREATE TABLE IF NOT EXISTS sessions (
     id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    session_number  SERIAL,                 -- auto-incrementing for easy reference
-    title           TEXT NOT NULL,           -- e.g. 'Phase 0 Step 2 Backend Deploy'
-    summary         TEXT NOT NULL,           -- what was accomplished
-    key_outputs     JSONB DEFAULT '[]',      -- files created, endpoints built, etc.
-    decisions_made  UUID[],                  -- links to decisions table
-    problems_hit    JSONB DEFAULT '[]',      -- errors, blockers encountered
-    next_actions    JSONB DEFAULT '[]',      -- what the NEXT session should do
-    context_for_next TEXT,                   -- free-text context that must carry forward
-    tools_used      TEXT[],                  -- e.g. ['claude_code', 'claude_chat', 'manual']
-    duration_mins   INTEGER,                -- approximate session length
+    project         TEXT NOT NULL DEFAULT 'fono' REFERENCES projects(id),
+    session_number  SERIAL,
+    title           TEXT NOT NULL,
+    summary         TEXT NOT NULL,
+    key_outputs     JSONB DEFAULT '[]',
+    decisions_made  UUID[],
+    problems_hit    JSONB DEFAULT '[]',
+    next_actions    JSONB DEFAULT '[]',
+    context_for_next TEXT,
+    tools_used      TEXT[],
+    duration_mins   INTEGER,
     started_at      TIMESTAMPTZ DEFAULT now(),
     ended_at        TIMESTAMPTZ
 );
 
+CREATE INDEX IF NOT EXISTS idx_sessions_project ON sessions(project);
+
 -- 5. CODE STATE: Track what files/modules exist and their purpose
 CREATE TABLE IF NOT EXISTS code_state (
     id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    file_path       TEXT NOT NULL UNIQUE,    -- e.g. 'apps/voice-service/main.py'
-    purpose         TEXT NOT NULL,           -- what this file does
-    status          TEXT NOT NULL DEFAULT 'active', -- active | stale | planned | deleted
+    project         TEXT NOT NULL DEFAULT 'fono' REFERENCES projects(id),
+    file_path       TEXT NOT NULL,
+    purpose         TEXT NOT NULL,
+    status          TEXT NOT NULL DEFAULT 'active',
     last_modified   TIMESTAMPTZ DEFAULT now(),
-    session_id      UUID,                   -- which session last touched it
-    notes           TEXT                     -- any important context
+    session_id      UUID,
+    notes           TEXT,
+    UNIQUE(project, file_path)
 );
 
 CREATE INDEX IF NOT EXISTS idx_code_state_status ON code_state(status);
+CREATE INDEX IF NOT EXISTS idx_code_state_project ON code_state(project);
 
 -- 6. OPEN QUESTIONS: Things that need to be resolved
 CREATE TABLE IF NOT EXISTS open_questions (
     id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    project         TEXT NOT NULL DEFAULT 'fono' REFERENCES projects(id),
     question        TEXT NOT NULL,
-    context         TEXT,                    -- why this matters
+    context         TEXT,
     category        TEXT DEFAULT 'technical',
-    status          TEXT NOT NULL DEFAULT 'open', -- open | answered | deferred
-    answer          TEXT,                    -- when resolved
-    session_id      UUID,                   -- which session raised this
+    status          TEXT NOT NULL DEFAULT 'open',
+    answer          TEXT,
+    session_id      UUID,
     created_at      TIMESTAMPTZ DEFAULT now(),
     resolved_at     TIMESTAMPTZ
 );
 
 CREATE INDEX IF NOT EXISTS idx_questions_status ON open_questions(status);
+CREATE INDEX IF NOT EXISTS idx_questions_project ON open_questions(project);
 
 -- ============================================================
 -- KNOWLEDGE LAYER (DocAgent integrated into CHIRAN Phase 0)
--- From ARCH-003 DocAgent Architecture + ARCH-008 Section 7
 -- ============================================================
 
--- 7. DOCUMENT NODES: Every piece of knowledge is a node
+-- 7. DOCUMENT NODES
 CREATE TABLE IF NOT EXISTS doc_nodes (
     id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    doc_id          TEXT NOT NULL,               -- e.g. 'ARCH-001', 'ARCH-008'
-    type            TEXT NOT NULL,               -- document | section | schema | agent | technology | phase
-    name            TEXT NOT NULL,               -- human-readable name
-    content         JSONB NOT NULL DEFAULT '{}', -- structured content (not raw prose)
-    metadata        JSONB DEFAULT '{}',          -- audience, tags, freshness_score, page_count
+    project         TEXT NOT NULL DEFAULT 'fono' REFERENCES projects(id),
+    doc_id          TEXT NOT NULL,
+    type            TEXT NOT NULL,
+    name            TEXT NOT NULL,
+    content         JSONB NOT NULL DEFAULT '{}',
+    metadata        JSONB DEFAULT '{}',
     version         INTEGER DEFAULT 1,
-    status          TEXT DEFAULT 'current',      -- current | superseded | archived | draft
-    updated_by      TEXT DEFAULT 'manual',       -- human or agent ID
+    status          TEXT DEFAULT 'current',
+    updated_by      TEXT DEFAULT 'manual',
     created_at      TIMESTAMPTZ DEFAULT now(),
     updated_at      TIMESTAMPTZ DEFAULT now()
 );
@@ -191,51 +224,54 @@ CREATE TABLE IF NOT EXISTS doc_nodes (
 CREATE INDEX IF NOT EXISTS idx_doc_nodes_doc_id ON doc_nodes(doc_id);
 CREATE INDEX IF NOT EXISTS idx_doc_nodes_type ON doc_nodes(type);
 CREATE INDEX IF NOT EXISTS idx_doc_nodes_status ON doc_nodes(status);
+CREATE INDEX IF NOT EXISTS idx_doc_nodes_project ON doc_nodes(project);
 
--- 8. DOCUMENT EDGES: Relationships between nodes
+-- 8. DOCUMENT EDGES
 CREATE TABLE IF NOT EXISTS doc_edges (
     from_node       UUID REFERENCES doc_nodes(id) ON DELETE CASCADE,
     to_node         UUID REFERENCES doc_nodes(id) ON DELETE CASCADE,
-    relation        TEXT NOT NULL,               -- depends_on | supersedes | contains | references
+    relation        TEXT NOT NULL,
     metadata        JSONB DEFAULT '{}',
     PRIMARY KEY (from_node, to_node, relation)
 );
 
--- 9. DOCUMENT VERSIONS: Change history for every node
+-- 9. DOCUMENT VERSIONS
 CREATE TABLE IF NOT EXISTS doc_versions (
     id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     node_id         UUID REFERENCES doc_nodes(id) ON DELETE CASCADE,
     version         INTEGER NOT NULL,
-    content         JSONB NOT NULL,              -- snapshot at this version
-    diff_summary    TEXT,                        -- human-readable description of change
+    content         JSONB NOT NULL,
+    diff_summary    TEXT,
     changed_by      TEXT,
     changed_at      TIMESTAMPTZ DEFAULT now()
 );
 
 CREATE INDEX IF NOT EXISTS idx_doc_versions_node ON doc_versions(node_id);
 
--- 10. STALENESS TRACKING: Detect when docs diverge from reality
+-- 10. STALENESS TRACKING
 CREATE TABLE IF NOT EXISTS doc_staleness (
     id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    doc_id          TEXT NOT NULL,               -- which document
+    project         TEXT NOT NULL DEFAULT 'fono' REFERENCES projects(id),
+    doc_id          TEXT NOT NULL,
     node_id         UUID REFERENCES doc_nodes(id) ON DELETE CASCADE,
-    issue           TEXT NOT NULL,               -- what's stale
-    severity        TEXT DEFAULT 'warning',      -- info | warning | critical
-    detected_by     TEXT DEFAULT 'staleness_checker', -- which check found it
-    status          TEXT DEFAULT 'open',         -- open | resolved | ignored
+    issue           TEXT NOT NULL,
+    severity        TEXT DEFAULT 'warning',
+    detected_by     TEXT DEFAULT 'staleness_checker',
+    status          TEXT DEFAULT 'open',
     detected_at     TIMESTAMPTZ DEFAULT now(),
     resolved_at     TIMESTAMPTZ
 );
 
 CREATE INDEX IF NOT EXISTS idx_staleness_status ON doc_staleness(status);
 
--- 11. COST EVENTS: Track API and compute costs (Phase 0 cost monitoring)
+-- 11. COST EVENTS
 CREATE TABLE IF NOT EXISTS cost_events (
     id              BIGSERIAL PRIMARY KEY,
-    agent_id        TEXT,                        -- which agent incurred the cost
-    division        TEXT,                        -- which division
-    provider        TEXT NOT NULL,               -- 'anthropic' | 'twilio' | 'railway' | 'elevenlabs' | etc.
-    operation       TEXT,                        -- 'claude_api_call' | 'twilio_call_minute' | etc.
+    project         TEXT NOT NULL DEFAULT 'fono' REFERENCES projects(id),
+    agent_id        TEXT,
+    division        TEXT,
+    provider        TEXT NOT NULL,
+    operation       TEXT,
     cost_usd        NUMERIC(10,6) NOT NULL,
     metadata        JSONB DEFAULT '{}',
     created_at      TIMESTAMPTZ DEFAULT now()
@@ -243,6 +279,72 @@ CREATE TABLE IF NOT EXISTS cost_events (
 
 CREATE INDEX IF NOT EXISTS idx_cost_events_date ON cost_events(created_at);
 CREATE INDEX IF NOT EXISTS idx_cost_events_division ON cost_events(division);
+CREATE INDEX IF NOT EXISTS idx_cost_events_project ON cost_events(project);
+"""
+
+# Migration SQL — adds project column to existing tables if not present
+MIGRATION_SQL = """
+-- Add project column to existing tables (idempotent)
+DO $$
+BEGIN
+    -- Ensure projects table exists first (for FK references)
+    IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'projects') THEN
+        CREATE TABLE projects (
+            id TEXT PRIMARY KEY, name TEXT NOT NULL, description TEXT,
+            status TEXT DEFAULT 'active', metadata JSONB DEFAULT '{}',
+            created_at TIMESTAMPTZ DEFAULT now()
+        );
+    END IF;
+    
+    -- Seed default projects
+    INSERT INTO projects (id, name, description) VALUES
+        ('fono', 'Fono', 'AI Voice Assistant for Telugu restaurants'),
+        ('salespilot', 'SalesPilot', 'Field sales route optimization'),
+        ('platform', 'Platform', 'Shared infrastructure — CHIRAN, IAD, agent architecture')
+    ON CONFLICT (id) DO NOTHING;
+
+    -- Add project column to each table if missing, default to 'fono'
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='deployment_state' AND column_name='project') THEN
+        ALTER TABLE deployment_state ADD COLUMN project TEXT NOT NULL DEFAULT 'fono';
+        -- Drop old unique constraint and add new one with project
+        ALTER TABLE deployment_state DROP CONSTRAINT IF EXISTS deployment_state_component_environment_key;
+        ALTER TABLE deployment_state ADD CONSTRAINT deployment_state_project_component_env_key UNIQUE(project, component, environment);
+    END IF;
+    
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='decisions' AND column_name='project') THEN
+        ALTER TABLE decisions ADD COLUMN project TEXT NOT NULL DEFAULT 'fono';
+    END IF;
+    
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='sprint_items' AND column_name='project') THEN
+        ALTER TABLE sprint_items ADD COLUMN project TEXT NOT NULL DEFAULT 'fono';
+    END IF;
+    
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='sessions' AND column_name='project') THEN
+        ALTER TABLE sessions ADD COLUMN project TEXT NOT NULL DEFAULT 'fono';
+    END IF;
+    
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='code_state' AND column_name='project') THEN
+        ALTER TABLE code_state ADD COLUMN project TEXT NOT NULL DEFAULT 'fono';
+        ALTER TABLE code_state DROP CONSTRAINT IF EXISTS code_state_file_path_key;
+        ALTER TABLE code_state ADD CONSTRAINT code_state_project_file_path_key UNIQUE(project, file_path);
+    END IF;
+    
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='open_questions' AND column_name='project') THEN
+        ALTER TABLE open_questions ADD COLUMN project TEXT NOT NULL DEFAULT 'fono';
+    END IF;
+    
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='doc_nodes' AND column_name='project') THEN
+        ALTER TABLE doc_nodes ADD COLUMN project TEXT NOT NULL DEFAULT 'fono';
+    END IF;
+    
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='doc_staleness' AND column_name='project') THEN
+        ALTER TABLE doc_staleness ADD COLUMN project TEXT NOT NULL DEFAULT 'fono';
+    END IF;
+    
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='cost_events' AND column_name='project') THEN
+        ALTER TABLE cost_events ADD COLUMN project TEXT NOT NULL DEFAULT 'fono';
+    END IF;
+END $$;
 """
 
 
@@ -445,12 +547,15 @@ class OpenQuestionOut(OpenQuestionCreate):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Startup: create pool + schema + MCP session manager. Shutdown: close pool."""
+    """Startup: create pool + migrate + schema + MCP session manager. Shutdown: close pool."""
     global db_pool
     db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=2, max_size=10)
     async with db_pool.acquire() as conn:
+        # Run migration first (adds project column to existing tables)
+        await conn.execute(MIGRATION_SQL)
+        # Then run full schema (for fresh installs)
         await conn.execute(SCHEMA_SQL)
-    print(f"🧠 CHIRAN Context Service ready on port {PORT}")
+    print(f"🧠 CHIRAN Context Service v0.3 (multi-project) ready on port {PORT}")
     
     # Start MCP session manager if available
     try:
@@ -502,163 +607,188 @@ try:
             raise RuntimeError("Database pool not initialized")
         return db_pool
     
+    def _project_filter(project: str) -> str:
+        """Return SQL WHERE clause for project filtering."""
+        if project == "all":
+            return ""
+        return f"project = '{project}'"
+    
     @mcp_server.tool()
-    async def generate_handoff(max_sessions: int = 3, include_code: bool = False) -> str:
-        """Load full Fono project context. CALL THIS AT THE START OF EVERY CONVERSATION.
+    async def generate_handoff(project: str = "fono", max_sessions: int = 3, include_code: bool = False) -> str:
+        """Load project context. CALL THIS AT THE START OF EVERY CONVERSATION.
+        Set project='fono', 'salespilot', 'platform', or 'all' for cross-project view.
         Returns deployment state, decisions, sprint priorities, recent sessions, open questions, and doc health."""
         try:
             pool = await _get_pool()
-            deployments = await pool.fetch(
-                "SELECT component, status, environment, version, details, deployed_at "
-                "FROM deployment_state ORDER BY component"
-            )
-            decisions = await pool.fetch(
-                "SELECT title, category, decision, reasoning, alternatives, status "
-                "FROM decisions WHERE status = 'active' ORDER BY decided_at DESC"
-            )
-            sprint = await pool.fetch(
-                "SELECT title, description, priority, status, blocker "
-                "FROM sprint_items WHERE status IN ('todo', 'in_progress', 'blocked') "
-                "ORDER BY priority, created_at"
-            )
-            sessions = await pool.fetch(
-                "SELECT session_number, title, summary, key_outputs, next_actions, "
-                "context_for_next, problems_hit, started_at "
-                "FROM sessions ORDER BY started_at DESC LIMIT $1",
-                max_sessions
-            )
-            questions = await pool.fetch(
-                "SELECT question, context, category "
-                "FROM open_questions WHERE status = 'open' ORDER BY created_at"
-            )
-            code_map = []
-            if include_code:
-                code_map = await pool.fetch(
-                    "SELECT file_path, purpose, status, notes "
-                    "FROM code_state WHERE status = 'active' ORDER BY file_path"
-                )
-            doc_staleness = await pool.fetch(
-                "SELECT doc_id, issue, severity FROM doc_staleness WHERE status = 'open' ORDER BY severity DESC LIMIT 10"
-            )
-            doc_count = await pool.fetchval(
-                "SELECT count(*) FROM doc_nodes WHERE type = 'document' AND status = 'current'"
-            )
-            cost_total = await pool.fetchval(
-                "SELECT COALESCE(SUM(cost_usd), 0) FROM cost_events WHERE created_at > now() - interval '7 days'"
-            )
+            pf = f"AND project = $1" if project != "all" else ""
+            pf_where = f"WHERE project = $1" if project != "all" else ""
+            params = [project] if project != "all" else []
+            
+            # Adjust param indices based on whether project filter is used
+            if project != "all":
+                deployments = await pool.fetch(
+                    f"SELECT component, status, environment, version, details, deployed_at "
+                    f"FROM deployment_state WHERE project = $1 ORDER BY component", project)
+                decisions = await pool.fetch(
+                    f"SELECT title, category, decision, reasoning, alternatives, status "
+                    f"FROM decisions WHERE status = 'active' AND project = $1 ORDER BY decided_at DESC", project)
+                sprint = await pool.fetch(
+                    f"SELECT title, description, priority, status, blocker "
+                    f"FROM sprint_items WHERE status IN ('todo', 'in_progress', 'blocked') AND project = $1 "
+                    f"ORDER BY priority, created_at", project)
+                sessions = await pool.fetch(
+                    f"SELECT session_number, title, summary, key_outputs, next_actions, "
+                    f"context_for_next, problems_hit, started_at "
+                    f"FROM sessions WHERE project = $1 ORDER BY started_at DESC LIMIT $2",
+                    project, max_sessions)
+                questions = await pool.fetch(
+                    f"SELECT question, context, category "
+                    f"FROM open_questions WHERE status = 'open' AND project = $1 ORDER BY created_at", project)
+                code_map = []
+                if include_code:
+                    code_map = await pool.fetch(
+                        f"SELECT file_path, purpose, status, notes "
+                        f"FROM code_state WHERE status = 'active' AND project = $1 ORDER BY file_path", project)
+                doc_staleness = await pool.fetch(
+                    f"SELECT doc_id, issue, severity FROM doc_staleness WHERE status = 'open' AND project = $1 ORDER BY severity DESC LIMIT 10", project)
+                doc_count = await pool.fetchval(
+                    f"SELECT count(*) FROM doc_nodes WHERE type = 'document' AND status = 'current' AND project = $1", project)
+                cost_total = await pool.fetchval(
+                    f"SELECT COALESCE(SUM(cost_usd), 0) FROM cost_events WHERE created_at > now() - interval '7 days' AND project = $1", project)
+            else:
+                deployments = await pool.fetch("SELECT component, status, environment, version, details, deployed_at FROM deployment_state ORDER BY project, component")
+                decisions = await pool.fetch("SELECT title, category, decision, reasoning, alternatives, status FROM decisions WHERE status = 'active' ORDER BY decided_at DESC")
+                sprint = await pool.fetch("SELECT title, description, priority, status, blocker FROM sprint_items WHERE status IN ('todo', 'in_progress', 'blocked') ORDER BY priority, created_at")
+                sessions = await pool.fetch("SELECT session_number, title, summary, key_outputs, next_actions, context_for_next, problems_hit, started_at FROM sessions ORDER BY started_at DESC LIMIT $1", max_sessions)
+                questions = await pool.fetch("SELECT question, context, category FROM open_questions WHERE status = 'open' ORDER BY created_at")
+                code_map = []
+                doc_staleness = await pool.fetch("SELECT doc_id, issue, severity FROM doc_staleness WHERE status = 'open' ORDER BY severity DESC LIMIT 10")
+                doc_count = await pool.fetchval("SELECT count(*) FROM doc_nodes WHERE type = 'document' AND status = 'current'")
+                cost_total = await pool.fetchval("SELECT COALESCE(SUM(cost_usd), 0) FROM cost_events WHERE created_at > now() - interval '7 days'")
+            
             handoff = _build_handoff_document(
                 deployments, decisions, sprint, sessions, questions, code_map,
-                doc_staleness, doc_count, float(cost_total),
+                doc_staleness, doc_count, float(cost_total), project_name=project.upper(),
             )
             return handoff
         except Exception as e:
             return f"Error generating handoff: {e}"
     
     @mcp_server.tool()
-    async def save_session(title: str, summary: str, next_actions: str = "[]", context_for_next: str = "", tools_used: str = "claude_chat", duration_mins: int = 60) -> str:
-        """Save a session summary at the END of every conversation. Records what was accomplished, next actions, and context for the next session."""
+    async def save_session(title: str, summary: str, project: str = "fono", next_actions: str = "[]", context_for_next: str = "", tools_used: str = "claude_chat", duration_mins: int = 60) -> str:
+        """Save a session summary at the END of every conversation. Set project='fono' or 'salespilot'."""
         try:
             pool = await _get_pool()
             parsed_actions = json.loads(next_actions) if next_actions.startswith("[") else [{"action": next_actions}]
             parsed_tools = [t.strip() for t in tools_used.split(",")]
             row = await pool.fetchrow("""
                 INSERT INTO sessions (
-                    title, summary, key_outputs, decisions_made, problems_hit,
+                    project, title, summary, key_outputs, decisions_made, problems_hit,
                     next_actions, context_for_next, tools_used, duration_mins, ended_at
-                ) VALUES ($1, $2, '[]'::jsonb, '{}', '[]'::jsonb, $3::jsonb, $4, $5, $6, now())
+                ) VALUES ($1, $2, $3, '[]'::jsonb, '{}', '[]'::jsonb, $4::jsonb, $5, $6, $7, now())
                 RETURNING session_number
-            """, title, summary, json.dumps(parsed_actions), context_for_next,
+            """, project, title, summary, json.dumps(parsed_actions), context_for_next,
                 parsed_tools, duration_mins)
-            return f"Session #{row['session_number']} saved: {title}"
+            return f"[{project}] Session #{row['session_number']} saved: {title}"
         except Exception as e:
             return f"Error saving session: {e}"
     
     @mcp_server.tool()
-    async def record_decision(title: str, decision: str, reasoning: str, category: str = "technical", alternatives: str = "[]") -> str:
-        """Record a technical or strategic decision with reasoning and rejected alternatives. Prevents Claude from re-suggesting rejected ideas in future sessions."""
+    async def record_decision(title: str, decision: str, reasoning: str, project: str = "fono", category: str = "technical", alternatives: str = "[]") -> str:
+        """Record a technical or strategic decision. Set project='fono', 'salespilot', or 'platform' for shared decisions."""
         try:
             pool = await _get_pool()
             parsed_alts = json.loads(alternatives) if alternatives.startswith("[") else []
             await pool.execute("""
-                INSERT INTO decisions (title, category, decision, reasoning, alternatives, status)
-                VALUES ($1, $2, $3, $4, $5::jsonb, 'active')
-            """, title, category, decision, reasoning, json.dumps(parsed_alts))
-            return f"Decision recorded: {title}"
+                INSERT INTO decisions (project, title, category, decision, reasoning, alternatives, status)
+                VALUES ($1, $2, $3, $4, $5, $6::jsonb, 'active')
+            """, project, title, category, decision, reasoning, json.dumps(parsed_alts))
+            return f"[{project}] Decision recorded: {title}"
         except Exception as e:
             return f"Error recording decision: {e}"
     
     @mcp_server.tool()
-    async def list_decisions(status: str = "active") -> str:
-        """List all active decisions. Check this before suggesting any technical approach to avoid re-suggesting rejected ideas."""
+    async def list_decisions(project: str = "fono", status: str = "active") -> str:
+        """List decisions for a project. Use project='all' for cross-project view."""
         try:
             pool = await _get_pool()
-            rows = await pool.fetch(
-                "SELECT title, decision, reasoning FROM decisions WHERE status = $1 ORDER BY decided_at DESC",
-                status
-            )
+            if project == "all":
+                rows = await pool.fetch(
+                    "SELECT project, title, decision, reasoning FROM decisions WHERE status = $1 ORDER BY decided_at DESC", status)
+            else:
+                rows = await pool.fetch(
+                    "SELECT project, title, decision, reasoning FROM decisions WHERE status = $1 AND project = $2 ORDER BY decided_at DESC", status, project)
             if not rows:
-                return "No active decisions recorded."
+                return f"No {status} decisions for {project}."
             lines = []
             for d in rows:
-                lines.append(f"- {d['title']}: {d['decision']} (Why: {d['reasoning']})")
+                prefix = f"[{d['project']}] " if project == "all" else ""
+                lines.append(f"- {prefix}{d['title']}: {d['decision']} (Why: {d['reasoning']})")
             return "\n".join(lines)
         except Exception as e:
             return f"Error listing decisions: {e}"
     
     @mcp_server.tool()
-    async def list_sprint(status: str = "") -> str:
-        """List current sprint items and priorities. Shows what to work on next."""
+    async def list_sprint(project: str = "fono", status: str = "") -> str:
+        """List sprint items for a project. Use project='all' for cross-project view."""
         try:
             pool = await _get_pool()
-            if status:
-                rows = await pool.fetch(
-                    "SELECT title, priority, status, blocker FROM sprint_items WHERE status = $1 ORDER BY priority, created_at",
-                    status
-                )
+            if project == "all":
+                if status:
+                    rows = await pool.fetch("SELECT project, title, priority, status, blocker FROM sprint_items WHERE status = $1 ORDER BY priority, created_at", status)
+                else:
+                    rows = await pool.fetch("SELECT project, title, priority, status, blocker FROM sprint_items WHERE status IN ('todo','in_progress','blocked') ORDER BY priority, created_at")
             else:
-                rows = await pool.fetch(
-                    "SELECT title, priority, status, blocker FROM sprint_items "
-                    "WHERE status IN ('todo','in_progress','blocked') ORDER BY priority, created_at"
-                )
+                if status:
+                    rows = await pool.fetch("SELECT project, title, priority, status, blocker FROM sprint_items WHERE status = $1 AND project = $2 ORDER BY priority, created_at", status, project)
+                else:
+                    rows = await pool.fetch("SELECT project, title, priority, status, blocker FROM sprint_items WHERE status IN ('todo','in_progress','blocked') AND project = $1 ORDER BY priority, created_at", project)
             if not rows:
-                return "No active sprint items."
+                return f"No active sprint items for {project}."
             prio_map = {1: "CRITICAL", 2: "HIGH", 3: "MEDIUM", 4: "LOW"}
             lines = []
             for s in rows:
+                prefix = f"[{s['project']}] " if project == "all" else ""
                 blocker = f" ⚠️ BLOCKED: {s['blocker']}" if s.get('blocker') else ""
-                lines.append(f"[{s['status']}] {prio_map.get(s['priority'], '?')}: {s['title']}{blocker}")
+                lines.append(f"[{s['status']}] {prio_map.get(s['priority'], '?')}: {prefix}{s['title']}{blocker}")
             return "\n".join(lines)
         except Exception as e:
             return f"Error listing sprint: {e}"
     
     @mcp_server.tool()
-    async def list_deployments() -> str:
-        """List all deployment states — what's live, in progress, or planned."""
+    async def list_deployments(project: str = "fono") -> str:
+        """List deployment states for a project. Use project='all' for cross-project view."""
         try:
             pool = await _get_pool()
-            rows = await pool.fetch("SELECT component, status, version FROM deployment_state ORDER BY component")
+            if project == "all":
+                rows = await pool.fetch("SELECT project, component, status, version FROM deployment_state ORDER BY project, component")
+            else:
+                rows = await pool.fetch("SELECT project, component, status, version FROM deployment_state WHERE project = $1 ORDER BY component", project)
             if not rows:
-                return "No deployments recorded."
+                return f"No deployments for {project}."
             lines = []
             for d in rows:
-                lines.append(f"{'✅' if d['status']=='deployed' else '📋'} {d['component']} [{d['status']}] {d['version'] or ''}")
+                prefix = f"[{d['project']}] " if project == "all" else ""
+                lines.append(f"{'✅' if d['status']=='deployed' else '📋'} {prefix}{d['component']} [{d['status']}] {d['version'] or ''}")
             return "\n".join(lines)
         except Exception as e:
             return f"Error listing deployments: {e}"
     
     @mcp_server.tool()
-    async def list_open_questions() -> str:
-        """List unresolved questions. Check this before making assumptions."""
+    async def list_open_questions(project: str = "fono") -> str:
+        """List unresolved questions for a project. Use project='all' for cross-project view."""
         try:
             pool = await _get_pool()
-            rows = await pool.fetch(
-                "SELECT question, context FROM open_questions WHERE status = 'open' ORDER BY created_at"
-            )
+            if project == "all":
+                rows = await pool.fetch("SELECT project, question, context FROM open_questions WHERE status = 'open' ORDER BY created_at")
+            else:
+                rows = await pool.fetch("SELECT project, question, context FROM open_questions WHERE status = 'open' AND project = $1 ORDER BY created_at", project)
             if not rows:
-                return "No open questions."
+                return f"No open questions for {project}."
             lines = []
             for q in rows:
-                lines.append(f"? {q['question']}")
+                prefix = f"[{q['project']}] " if project == "all" else ""
+                lines.append(f"? {prefix}{q['question']}")
                 if q.get('context'):
                     lines.append(f"  Context: {q['context']}")
             return "\n".join(lines)
@@ -666,20 +796,30 @@ try:
             return f"Error listing questions: {e}"
     
     @mcp_server.tool()
-    async def search_docs(query: str) -> str:
-        """Search the document knowledge graph. Find which architecture docs mention a specific topic."""
+    async def search_docs(query: str, project: str = "fono") -> str:
+        """Search the document knowledge graph for a project."""
         try:
             pool = await _get_pool()
-            rows = await pool.fetch("""
-                SELECT doc_id, name, type FROM doc_nodes
-                WHERE status = 'current'
-                  AND (name ILIKE '%' || $1 || '%' OR doc_id ILIKE '%' || $1 || '%'
-                       OR content::text ILIKE '%' || $1 || '%')
-                ORDER BY CASE WHEN name ILIKE '%' || $1 || '%' THEN 0 ELSE 1 END, doc_id
-                LIMIT 20
-            """, query)
+            if project == "all":
+                rows = await pool.fetch("""
+                    SELECT doc_id, name, type FROM doc_nodes
+                    WHERE status = 'current'
+                      AND (name ILIKE '%' || $1 || '%' OR doc_id ILIKE '%' || $1 || '%'
+                           OR content::text ILIKE '%' || $1 || '%')
+                    ORDER BY CASE WHEN name ILIKE '%' || $1 || '%' THEN 0 ELSE 1 END, doc_id
+                    LIMIT 20
+                """, query)
+            else:
+                rows = await pool.fetch("""
+                    SELECT doc_id, name, type FROM doc_nodes
+                    WHERE status = 'current' AND project = $2
+                      AND (name ILIKE '%' || $1 || '%' OR doc_id ILIKE '%' || $1 || '%'
+                           OR content::text ILIKE '%' || $1 || '%')
+                    ORDER BY CASE WHEN name ILIKE '%' || $1 || '%' THEN 0 ELSE 1 END, doc_id
+                    LIMIT 20
+                """, query, project)
             if not rows:
-                return f"No documents found matching '{query}'."
+                return f"No documents found matching '{query}' in {project}."
             lines = [f"Found {len(rows)} results for '{query}':"]
             for r in rows:
                 lines.append(f"- [{r['doc_id']}] {r['name']} ({r['type']})")
@@ -688,20 +828,37 @@ try:
             return f"Error searching docs: {e}"
     
     @mcp_server.tool()
-    async def get_doc_manifest() -> str:
-        """Get the live document manifest — all architecture docs, their versions, and status."""
+    async def get_doc_manifest(project: str = "fono") -> str:
+        """Get the live document manifest for a project."""
         try:
             pool = await _get_pool()
-            rows = await pool.fetch("""
-                SELECT doc_id, name, version, status
-                FROM doc_nodes WHERE type = 'document' ORDER BY doc_id
-            """)
+            if project == "all":
+                rows = await pool.fetch("SELECT project, doc_id, name, version, status FROM doc_nodes WHERE type = 'document' ORDER BY project, doc_id")
+            else:
+                rows = await pool.fetch("SELECT project, doc_id, name, version, status FROM doc_nodes WHERE type = 'document' AND project = $1 ORDER BY doc_id", project)
             lines = [f"Document Manifest ({len(rows)} documents):"]
             for d in rows:
-                lines.append(f"- {d['doc_id']}: {d['name']} [v{d.get('version', '?')}] ({d.get('status', '?')})")
+                prefix = f"[{d['project']}] " if project == "all" else ""
+                lines.append(f"- {prefix}{d['doc_id']}: {d['name']} [v{d.get('version', '?')}] ({d.get('status', '?')})")
             return "\n".join(lines)
         except Exception as e:
             return f"Error getting manifest: {e}"
+    
+    @mcp_server.tool()
+    async def list_projects() -> str:
+        """List all projects CHIRAN manages."""
+        try:
+            pool = await _get_pool()
+            rows = await pool.fetch("SELECT id, name, description, status FROM projects ORDER BY id")
+            if not rows:
+                return "No projects registered."
+            lines = ["CHIRAN manages these projects:"]
+            for p in rows:
+                emoji = "✅" if p['status'] == 'active' else "⏸️"
+                lines.append(f"  {emoji} {p['id']}: {p['name']} — {p['description'] or 'No description'}")
+            return "\n".join(lines)
+        except Exception as e:
+            return f"Error listing projects: {e}"
 
     # Mount MCP Streamable HTTP app
     # FastMCP's streamable_http_app() creates routes at /mcp internally
@@ -829,13 +986,16 @@ async def generate_handoff(
 
 def _build_handoff_document(
     deployments, decisions, sprint, sessions, questions, code_map,
-    doc_staleness=None, doc_count=0, cost_7d=0.0,
+    doc_staleness=None, doc_count=0, cost_7d=0.0, project_name="FONO",
 ) -> str:
     """Build the structured handoff document for Claude."""
     
     lines = []
     lines.append("=" * 70)
-    lines.append("FONO (formerly VoiceOrder) — CHIRAN CONTEXT HANDOFF")
+    if project_name == "ALL":
+        lines.append("CHIRAN — CROSS-PROJECT CONTEXT HANDOFF")
+    else:
+        lines.append(f"{project_name} — CHIRAN CONTEXT HANDOFF")
     lines.append(f"Generated: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}")
     lines.append("=" * 70)
     lines.append("")
