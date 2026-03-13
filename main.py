@@ -1033,7 +1033,7 @@ def _build_handoff_document(
             alts = json.loads(d["alternatives"]) if isinstance(d["alternatives"], str) else d["alternatives"]
             if alts:
                 rejected = ", ".join(
-                    a.get("name", "?") for a in alts
+                    a.get("name", "?") if isinstance(a, dict) else str(a) for a in alts
                 )
                 lines.append(f"    Rejected: {rejected}")
             lines.append("")
