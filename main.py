@@ -280,6 +280,29 @@ CREATE TABLE IF NOT EXISTS cost_events (
 CREATE INDEX IF NOT EXISTS idx_cost_events_date ON cost_events(created_at);
 CREATE INDEX IF NOT EXISTS idx_cost_events_division ON cost_events(division);
 CREATE INDEX IF NOT EXISTS idx_cost_events_project ON cost_events(project);
+
+-- 12. TASK QUEUE: Agent-executable tasks with briefs
+CREATE TABLE IF NOT EXISTS tasks (
+    id              SERIAL PRIMARY KEY,
+    project         TEXT NOT NULL DEFAULT 'fono' REFERENCES projects(id),
+    title           TEXT NOT NULL,
+    brief           TEXT,
+    priority        INTEGER NOT NULL DEFAULT 3,
+    status          TEXT NOT NULL DEFAULT 'draft',
+    assigned_to     TEXT DEFAULT 'claude_code',
+    depends_on      INTEGER[],
+    blocked_reason  TEXT,
+    result          TEXT,
+    error           TEXT,
+    created_by      TEXT DEFAULT 'claude_chat',
+    created_at      TIMESTAMPTZ DEFAULT now(),
+    started_at      TIMESTAMPTZ,
+    completed_at    TIMESTAMPTZ,
+    updated_at      TIMESTAMPTZ DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_tasks_project_status ON tasks(project, status);
+CREATE INDEX IF NOT EXISTS idx_tasks_priority ON tasks(priority);
 """
 
 # Migration SQL — adds project column to existing tables if not present
@@ -655,6 +678,10 @@ try:
                     f"SELECT count(*) FROM doc_nodes WHERE type = 'document' AND status = 'current' AND project = $1", project)
                 cost_total = await pool.fetchval(
                     f"SELECT COALESCE(SUM(cost_usd), 0) FROM cost_events WHERE created_at > now() - interval '7 days' AND project = $1", project)
+                tasks = await pool.fetch(
+                    "SELECT * FROM tasks WHERE project = $1 AND status NOT IN ('done', 'failed') ORDER BY priority, created_at", project)
+                done_tasks = await pool.fetch(
+                    "SELECT * FROM tasks WHERE project = $1 AND status IN ('done', 'failed') ORDER BY completed_at DESC LIMIT 5", project)
             else:
                 deployments = await pool.fetch("SELECT component, status, environment, version, details, deployed_at FROM deployment_state ORDER BY project, component")
                 decisions = await pool.fetch("SELECT title, category, decision, reasoning, alternatives, status FROM decisions WHERE status = 'active' ORDER BY decided_at DESC")
@@ -665,10 +692,13 @@ try:
                 doc_staleness = await pool.fetch("SELECT doc_id, issue, severity FROM doc_staleness WHERE status = 'open' ORDER BY severity DESC LIMIT 10")
                 doc_count = await pool.fetchval("SELECT count(*) FROM doc_nodes WHERE type = 'document' AND status = 'current'")
                 cost_total = await pool.fetchval("SELECT COALESCE(SUM(cost_usd), 0) FROM cost_events WHERE created_at > now() - interval '7 days'")
-            
+                tasks = await pool.fetch("SELECT * FROM tasks WHERE status NOT IN ('done', 'failed') ORDER BY priority, created_at")
+                done_tasks = await pool.fetch("SELECT * FROM tasks WHERE status IN ('done', 'failed') ORDER BY completed_at DESC LIMIT 5")
+
             handoff = _build_handoff_document(
                 deployments, decisions, sprint, sessions, questions, code_map,
                 doc_staleness, doc_count, float(cost_total), project_name=project.upper(),
+                tasks=list(tasks) + list(done_tasks),
             )
             return handoff
         except Exception as e:
@@ -860,6 +890,171 @@ try:
         except Exception as e:
             return f"Error listing projects: {e}"
 
+    # ── TASK QUEUE MCP TOOLS ────────────────────────────────────────────────
+
+    @mcp_server.tool()
+    async def create_task(title: str, brief: str = "", project: str = "fono", priority: int = 3, assigned_to: str = "claude_code", depends_on: str = "", status: str = "draft") -> str:
+        """Create a task in the CHIRAN task queue. Set priority 1-5 (1=critical). depends_on is comma-separated task IDs."""
+        try:
+            pool = await _get_pool()
+            deps = None
+            if depends_on:
+                deps = [int(d.strip().replace("T-", "")) for d in depends_on.split(",") if d.strip()]
+            row = await pool.fetchrow("""
+                INSERT INTO tasks (project, title, brief, priority, status, assigned_to, depends_on, created_by)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, 'claude_chat')
+                RETURNING id, title, priority, status
+            """, project, title, brief or None, priority, status, assigned_to, deps)
+            prio_map = {1: "critical", 2: "high", 3: "medium", 4: "low", 5: "backlog"}
+            return f"[{project}] Task created: T-{row['id']} \"{row['title']}\" (priority: {prio_map.get(row['priority'], '?')}, status: {row['status']})"
+        except Exception as e:
+            return f"Error creating task: {e}"
+
+    @mcp_server.tool()
+    async def list_tasks(project: str = "fono", status: str = "") -> str:
+        """List tasks from the CHIRAN task queue. Filter by project and/or status. Use project='all' for cross-project."""
+        try:
+            pool = await _get_pool()
+            if status:
+                if project == "all":
+                    rows = await pool.fetch("SELECT * FROM tasks WHERE status = $1 ORDER BY priority, created_at", status)
+                else:
+                    rows = await pool.fetch("SELECT * FROM tasks WHERE status = $1 AND project = $2 ORDER BY priority, created_at", status, project)
+            else:
+                if project == "all":
+                    rows = await pool.fetch("SELECT * FROM tasks WHERE status NOT IN ('done', 'failed') ORDER BY priority, created_at")
+                else:
+                    rows = await pool.fetch("SELECT * FROM tasks WHERE status NOT IN ('done', 'failed') AND project = $1 ORDER BY priority, created_at", project)
+                # Also fetch recently done (last 5)
+                if project == "all":
+                    done_rows = await pool.fetch("SELECT * FROM tasks WHERE status IN ('done', 'failed') ORDER BY completed_at DESC LIMIT 5")
+                else:
+                    done_rows = await pool.fetch("SELECT * FROM tasks WHERE status IN ('done', 'failed') AND project = $1 ORDER BY completed_at DESC LIMIT 5", project)
+                rows = list(rows) + list(done_rows)
+
+            if not rows:
+                return f"No tasks found for {project}."
+
+            prio_emoji = {1: "\U0001f534 P1", 2: "\U0001f7e0 P2", 3: "\U0001f7e1 P3", 4: "\u26aa P4", 5: "\U0001f4a4 P5"}
+            groups = {}
+            for t in rows:
+                s = t["status"]
+                if s not in groups:
+                    groups[s] = []
+                groups[s].append(t)
+
+            order = ["approved", "ready", "running", "draft", "blocked", "done", "failed"]
+            labels = {"approved": "APPROVED (ready to execute)", "ready": "READY (needs approval)",
+                      "running": "RUNNING", "draft": "DRAFT (needs review)",
+                      "blocked": "BLOCKED", "done": "RECENTLY DONE", "failed": "FAILED"}
+
+            lines = [f"TASK QUEUE — {project}", ""]
+            for s in order:
+                if s not in groups:
+                    continue
+                lines.append(f"  {labels.get(s, s.upper())}:")
+                for t in groups[s]:
+                    prefix = f"[{t['project']}] " if project == "all" else ""
+                    pe = prio_emoji.get(t["priority"], "?")
+                    line = f"  [T-{t['id']}] {pe}: {prefix}{t['title']}"
+                    if t.get("assigned_to"):
+                        line += f" (assigned: {t['assigned_to']})"
+                    if s == "running" and t.get("started_at"):
+                        elapsed = datetime.now(timezone.utc) - t["started_at"]
+                        hours = int(elapsed.total_seconds() // 3600)
+                        if hours > 0:
+                            line += f" started: {hours}h ago"
+                    if s == "blocked" and t.get("blocked_reason"):
+                        line += f" — {t['blocked_reason']}"
+                    if s in ("done", "failed") and t.get("completed_at"):
+                        elapsed = datetime.now(timezone.utc) - t["completed_at"]
+                        hours = int(elapsed.total_seconds() // 3600)
+                        line += f" (completed: {hours}h ago)"
+                    if s == "done":
+                        line = f"  [T-{t['id']}] \u2705 {prefix}{t['title']}"
+                        if t.get("completed_at"):
+                            elapsed = datetime.now(timezone.utc) - t["completed_at"]
+                            hours = int(elapsed.total_seconds() // 3600)
+                            line += f" (completed: {hours}h ago)"
+                    lines.append(line)
+                lines.append("")
+
+            return "\n".join(lines)
+        except Exception as e:
+            return f"Error listing tasks: {e}"
+
+    @mcp_server.tool()
+    async def update_task(task_id: str, status: str = "", result: str = "", error: str = "", brief: str = "", priority: int = 0, blocked_reason: str = "") -> str:
+        """Update a task's status, result, or other fields. task_id can be 'T-1' or '1'."""
+        try:
+            pool = await _get_pool()
+            tid = int(task_id.replace("T-", ""))
+
+            # Fetch current task
+            task = await pool.fetchrow("SELECT * FROM tasks WHERE id = $1", tid)
+            if not task:
+                return f"Task T-{tid} not found."
+
+            sets = ["updated_at = now()"]
+            params = []
+            idx = 1
+
+            if status:
+                sets.append(f"status = ${idx}")
+                params.append(status)
+                idx += 1
+                if status == "running":
+                    sets.append("started_at = now()")
+                elif status in ("done", "failed"):
+                    sets.append("completed_at = now()")
+
+            if result:
+                sets.append(f"result = ${idx}")
+                params.append(result)
+                idx += 1
+
+            if error:
+                sets.append(f"error = ${idx}")
+                params.append(error)
+                idx += 1
+
+            if brief:
+                sets.append(f"brief = ${idx}")
+                params.append(brief)
+                idx += 1
+
+            if priority > 0:
+                sets.append(f"priority = ${idx}")
+                params.append(priority)
+                idx += 1
+
+            if blocked_reason:
+                sets.append(f"blocked_reason = ${idx}")
+                params.append(blocked_reason)
+                idx += 1
+
+            params.append(tid)
+            query = f"UPDATE tasks SET {', '.join(sets)} WHERE id = ${idx} RETURNING id, title, status, result"
+            row = await pool.fetchrow(query, *params)
+
+            parts = [f"[{task['project']}] Task T-{row['id']} updated:"]
+            if status:
+                parts.append(f"status -> {status}")
+            if result:
+                parts.append(f"result: {result[:100]}")
+            if error:
+                parts.append(f"error: {error[:100]}")
+            if brief:
+                parts.append("brief updated")
+            if priority > 0:
+                parts.append(f"priority -> {priority}")
+            if blocked_reason:
+                parts.append(f"blocked: {blocked_reason}")
+
+            return ", ".join(parts)
+        except Exception as e:
+            return f"Error updating task: {e}"
+
     # Mount MCP Streamable HTTP app
     # FastMCP's streamable_http_app() creates routes at /mcp internally
     # Mounting at /mcp-server makes the endpoint /mcp-server/mcp
@@ -960,11 +1155,20 @@ async def generate_handoff(
     cost_total = await pool.fetchval(
         "SELECT COALESCE(SUM(cost_usd), 0) FROM cost_events WHERE created_at > now() - interval '7 days'"
     )
-    
+
+    # 9. Task queue
+    active_tasks = await pool.fetch(
+        "SELECT * FROM tasks WHERE status NOT IN ('done', 'failed') ORDER BY priority, created_at"
+    )
+    done_tasks = await pool.fetch(
+        "SELECT * FROM tasks WHERE status IN ('done', 'failed') ORDER BY completed_at DESC LIMIT 5"
+    )
+
     # Build the handoff document
     handoff = _build_handoff_document(
         deployments, decisions, sprint, sessions, questions, code_map,
         doc_staleness, doc_count, float(cost_total),
+        tasks=list(active_tasks) + list(done_tasks),
     )
     
     return {
@@ -978,6 +1182,7 @@ async def generate_handoff(
             "open_questions": len(questions),
             "documents_tracked": doc_count,
             "open_staleness_issues": len(doc_staleness),
+            "active_tasks": len(active_tasks),
             "cost_7d_usd": float(cost_total),
         },
         "usage": "Copy the 'handoff' field content and paste at the start of a new Claude session."
@@ -987,6 +1192,7 @@ async def generate_handoff(
 def _build_handoff_document(
     deployments, decisions, sprint, sessions, questions, code_map,
     doc_staleness=None, doc_count=0, cost_7d=0.0, project_name="FONO",
+    tasks=None,
 ) -> str:
     """Build the structured handoff document for Claude."""
     
@@ -1058,7 +1264,51 @@ def _build_handoff_document(
     else:
         lines.append("  (no sprint items)")
     lines.append("")
-    
+
+    # --- TASK QUEUE ---
+    lines.append("## TASK QUEUE (Delegated Work Items)")
+    lines.append("")
+    if tasks:
+        priority_emoji = {1: "🔴", 2: "🟠", 3: "🟡", 4: "🟢"}
+        status_icon = {
+            "draft": "📝", "ready": "📦", "approved": "📦",
+            "in_progress": "⚙️", "running": "⚙️",
+            "blocked": "🚫", "done": "✅", "failed": "❌",
+        }
+        # Group: active first, then completed/failed
+        active = [t for t in tasks if t["status"] not in ("done", "failed")]
+        finished = [t for t in tasks if t["status"] in ("done", "failed")]
+
+        if active:
+            for t in active:
+                icon = status_icon.get(t["status"], "❓")
+                prio = priority_emoji.get(t["priority"], "")
+                dep_str = ""
+                if t.get("depends_on"):
+                    dep_str = f" (depends on: {t['depends_on']})"
+                blocked_str = ""
+                if t.get("blocked_reason"):
+                    blocked_str = f" ⚠️ {t['blocked_reason']}"
+                lines.append(f"  {icon} {prio} #{t['id']} {t['title']} [{t['status']}]{dep_str}{blocked_str}")
+                if t.get("brief"):
+                    brief_lines = t["brief"].strip().split("\n")
+                    lines.append(f"       Brief: {brief_lines[0]}" + (f" (+{len(brief_lines)-1} lines)" if len(brief_lines) > 1 else ""))
+
+        if finished:
+            lines.append("")
+            lines.append("  Recently completed:")
+            for t in finished:
+                icon = status_icon.get(t["status"], "❓")
+                result_str = ""
+                if t.get("result"):
+                    result_str = f" → {t['result'][:80]}"
+                elif t.get("error"):
+                    result_str = f" → ERROR: {t['error'][:80]}"
+                lines.append(f"    {icon} #{t['id']} {t['title']}{result_str}")
+    else:
+        lines.append("  (no tasks queued)")
+    lines.append("")
+
     # --- RECENT SESSIONS ---
     lines.append("## RECENT SESSIONS (What happened recently)")
     lines.append("")
