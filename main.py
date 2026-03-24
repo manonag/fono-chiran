@@ -765,14 +765,14 @@ try:
             pool = await _get_pool()
             if project == "all":
                 if status:
-                    rows = await pool.fetch("SELECT project, title, priority, status, blocker FROM sprint_items WHERE status = $1 ORDER BY priority, created_at", status)
+                    rows = await pool.fetch("SELECT id, project, title, priority, status, blocker FROM sprint_items WHERE status = $1 ORDER BY priority, created_at", status)
                 else:
-                    rows = await pool.fetch("SELECT project, title, priority, status, blocker FROM sprint_items WHERE status IN ('todo','in_progress','blocked') ORDER BY priority, created_at")
+                    rows = await pool.fetch("SELECT id, project, title, priority, status, blocker FROM sprint_items WHERE status IN ('todo','in_progress','blocked') ORDER BY priority, created_at")
             else:
                 if status:
-                    rows = await pool.fetch("SELECT project, title, priority, status, blocker FROM sprint_items WHERE status = $1 AND project = $2 ORDER BY priority, created_at", status, project)
+                    rows = await pool.fetch("SELECT id, project, title, priority, status, blocker FROM sprint_items WHERE status = $1 AND project = $2 ORDER BY priority, created_at", status, project)
                 else:
-                    rows = await pool.fetch("SELECT project, title, priority, status, blocker FROM sprint_items WHERE status IN ('todo','in_progress','blocked') AND project = $1 ORDER BY priority, created_at", project)
+                    rows = await pool.fetch("SELECT id, project, title, priority, status, blocker FROM sprint_items WHERE status IN ('todo','in_progress','blocked') AND project = $1 ORDER BY priority, created_at", project)
             if not rows:
                 return f"No active sprint items for {project}."
             prio_map = {1: "CRITICAL", 2: "HIGH", 3: "MEDIUM", 4: "LOW"}
@@ -780,11 +780,88 @@ try:
             for s in rows:
                 prefix = f"[{s['project']}] " if project == "all" else ""
                 blocker = f" ⚠️ BLOCKED: {s['blocker']}" if s.get('blocker') else ""
-                lines.append(f"[{s['status']}] {prio_map.get(s['priority'], '?')}: {prefix}{s['title']}{blocker}")
+                lines.append(f"  {s['id']} [{s['status']}] {prio_map.get(s['priority'], '?')}: {prefix}{s['title']}{blocker}")
             return "\n".join(lines)
         except Exception as e:
             return f"Error listing sprint: {e}"
-    
+
+    @mcp_server.tool()
+    async def create_sprint_item(title: str, project: str = "fono", priority: int = 3, description: str = "", status: str = "todo", blocker: str = "") -> str:
+        """Create a sprint item. Priority 1-4 (1=CRITICAL, 2=HIGH, 3=MEDIUM, 4=LOW). Status: todo/in_progress/blocked/done."""
+        try:
+            pool = await _get_pool()
+            row = await pool.fetchrow("""
+                INSERT INTO sprint_items (project, title, description, priority, status, blocker)
+                VALUES ($1, $2, $3, $4, $5, $6)
+                RETURNING id, title, priority, status
+            """, project, title, description or None, priority, status, blocker or None)
+            prio_map = {1: "CRITICAL", 2: "HIGH", 3: "MEDIUM", 4: "LOW"}
+            return f"[{project}] Sprint item created: {row['id']} \"{row['title']}\" (priority: {prio_map.get(row['priority'], '?')}, status: {row['status']})"
+        except Exception as e:
+            return f"Error creating sprint item: {e}"
+
+    @mcp_server.tool()
+    async def update_sprint_item(item_id: str, status: str = "", priority: int = 0, blocker: str = "", description: str = "") -> str:
+        """Update a sprint item. item_id is the UUID from list_sprint. Set blocker='clear' to remove a blocker."""
+        try:
+            pool = await _get_pool()
+            existing = await pool.fetchrow("SELECT * FROM sprint_items WHERE id = $1::uuid", item_id)
+            if not existing:
+                return f"Sprint item {item_id} not found."
+
+            sets = ["updated_at = now()"]
+            params = []
+            idx = 1
+
+            if status:
+                sets.append(f"status = ${idx}")
+                params.append(status)
+                idx += 1
+                if status == "done":
+                    sets.append("completed_at = now()")
+
+            if priority > 0:
+                sets.append(f"priority = ${idx}")
+                params.append(priority)
+                idx += 1
+
+            if blocker:
+                if blocker.lower() in ("clear", "none", "resolved"):
+                    sets.append("blocker = NULL")
+                else:
+                    sets.append(f"blocker = ${idx}")
+                    params.append(blocker)
+                    idx += 1
+
+            if description:
+                sets.append(f"description = ${idx}")
+                params.append(description)
+                idx += 1
+
+            if len(sets) == 1:
+                return "No fields to update. Provide status, priority, blocker, or description."
+
+            params.append(item_id)
+            query = f"UPDATE sprint_items SET {', '.join(sets)} WHERE id = ${idx}::uuid RETURNING id, title, status, priority"
+            row = await pool.fetchrow(query, *params)
+
+            prio_map = {1: "CRITICAL", 2: "HIGH", 3: "MEDIUM", 4: "LOW"}
+            return f"Sprint item updated: {row['id']} \"{row['title']}\" → status={row['status']}, priority={prio_map.get(row['priority'], '?')}"
+        except Exception as e:
+            return f"Error updating sprint item: {e}"
+
+    @mcp_server.tool()
+    async def delete_sprint_item(item_id: str) -> str:
+        """Delete a sprint item by its UUID."""
+        try:
+            pool = await _get_pool()
+            row = await pool.fetchrow("DELETE FROM sprint_items WHERE id = $1::uuid RETURNING id, title", item_id)
+            if not row:
+                return f"Sprint item {item_id} not found."
+            return f"Sprint item deleted: {row['id']} \"{row['title']}\""
+        except Exception as e:
+            return f"Error deleting sprint item: {e}"
+
     @mcp_server.tool()
     async def list_deployments(project: str = "fono") -> str:
         """List deployment states for a project. Use project='all' for cross-project view."""
