@@ -709,7 +709,10 @@ try:
         """Save a session summary at the END of every conversation. Set project='fono' or 'salespilot'."""
         try:
             pool = await _get_pool()
-            parsed_actions = json.loads(next_actions) if next_actions.startswith("[") else [{"action": next_actions}]
+            try:
+                parsed_actions = json.loads(next_actions) if isinstance(next_actions, str) and next_actions.strip().startswith("[") else [{"action": next_actions}]
+            except (json.JSONDecodeError, TypeError):
+                parsed_actions = [{"action": str(next_actions)}]
             parsed_tools = [t.strip() for t in tools_used.split(",")]
             row = await pool.fetchrow("""
                 INSERT INTO sessions (
@@ -728,7 +731,12 @@ try:
         """Record a technical or strategic decision. Set project='fono', 'salespilot', or 'platform' for shared decisions."""
         try:
             pool = await _get_pool()
-            parsed_alts = json.loads(alternatives) if alternatives.startswith("[") else []
+            try:
+                parsed_alts = json.loads(alternatives) if isinstance(alternatives, str) and alternatives.strip().startswith("[") else []
+            except (json.JSONDecodeError, TypeError):
+                parsed_alts = []
+            if not isinstance(parsed_alts, list):
+                parsed_alts = [parsed_alts] if parsed_alts else []
             await pool.execute("""
                 INSERT INTO decisions (project, title, category, decision, reasoning, alternatives, status)
                 VALUES ($1, $2, $3, $4, $5, $6::jsonb, 'active')
@@ -971,12 +979,22 @@ try:
 
     @mcp_server.tool()
     async def create_task(title: str, brief: str = "", project: str = "fono", priority: int = 3, assigned_to: str = "claude_code", depends_on: str = "", status: str = "draft") -> str:
-        """Create a task in the CHIRAN task queue. Set priority 1-5 (1=critical). depends_on is comma-separated task IDs."""
+        """Create a task in the CHIRAN task queue. Set priority 1-5 (1=critical). depends_on is comma-separated task IDs (e.g. '1,2' or 'T-1,T-2')."""
         try:
             pool = await _get_pool()
+            # Parse depends_on: handle "", "T-1,T-2", "1,2", lists, and malformed input
             deps = None
-            if depends_on:
-                deps = [int(d.strip().replace("T-", "")) for d in depends_on.split(",") if d.strip()]
+            if depends_on and isinstance(depends_on, str) and depends_on.strip():
+                try:
+                    raw_parts = [d.strip().replace("T-", "").replace("t-", "") for d in depends_on.split(",") if d.strip()]
+                    deps = [int(x) for x in raw_parts if x.isdigit()]
+                except (ValueError, TypeError):
+                    deps = None
+            elif isinstance(depends_on, list):
+                deps = [int(x) for x in depends_on if str(x).strip().isdigit()]
+            # Never pass empty list to asyncpg — must be None or list[int]
+            if not deps:
+                deps = None
             row = await pool.fetchrow("""
                 INSERT INTO tasks (project, title, brief, priority, status, assigned_to, depends_on, created_by)
                 VALUES ($1, $2, $3, $4, $5, $6, $7, 'claude_chat')
@@ -1148,15 +1166,62 @@ except ImportError:
 # HEALTH CHECK
 # =============================================================================
 
+EXPECTED_MCP_TOOLS = [
+    "generate_handoff", "save_session", "record_decision", "list_decisions",
+    "list_sprint", "create_sprint_item", "update_sprint_item", "delete_sprint_item",
+    "list_deployments", "list_open_questions", "search_docs", "get_doc_manifest",
+    "list_projects", "create_task", "list_tasks", "update_task",
+]
+
 @app.get("/health")
 async def health(pool: asyncpg.Pool = Depends(get_db)):
-    """Health check with DB connectivity test."""
-    row = await pool.fetchval("SELECT count(*) FROM sessions")
+    """Health check with DB connectivity and MCP tool registration verification."""
+    checks = {}
+    overall = "healthy"
+
+    # DB connectivity
+    try:
+        session_count = await pool.fetchval("SELECT count(*) FROM sessions")
+        checks["database"] = {"status": "ok", "sessions": session_count}
+    except Exception as e:
+        checks["database"] = {"status": "error", "error": str(e)}
+        overall = "degraded"
+
+    # MCP tool registration
+    try:
+        registered_tools = list(mcp_server._tool_manager._tools.keys())
+        missing = [t for t in EXPECTED_MCP_TOOLS if t not in registered_tools]
+        unexpected = [t for t in registered_tools if t not in EXPECTED_MCP_TOOLS]
+        checks["mcp_tools"] = {
+            "status": "ok" if not missing else "error",
+            "registered": len(registered_tools),
+            "expected": len(EXPECTED_MCP_TOOLS),
+            "tools": sorted(registered_tools),
+        }
+        if missing:
+            checks["mcp_tools"]["missing"] = missing
+            overall = "degraded"
+        if unexpected:
+            checks["mcp_tools"]["unexpected"] = unexpected
+    except Exception as e:
+        checks["mcp_tools"] = {"status": "error", "error": str(e)}
+        overall = "degraded"
+
+    # Table existence check
+    try:
+        tables = await pool.fetch(
+            "SELECT tablename FROM pg_tables WHERE schemaname = 'public' ORDER BY tablename"
+        )
+        checks["tables"] = {"status": "ok", "count": len(tables), "names": [t["tablename"] for t in tables]}
+    except Exception as e:
+        checks["tables"] = {"status": "error", "error": str(e)}
+        overall = "degraded"
+
     return {
-        "status": "healthy",
+        "status": overall,
         "service": "chiran-context",
-        "total_sessions": row,
-        "timestamp": datetime.now(timezone.utc).isoformat()
+        "checks": checks,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
     }
 
 
@@ -1296,10 +1361,15 @@ def _build_handoff_document(
             if d["version"]:
                 line += f" — {d['version']}"
             if d["details"]:
-                details = json.loads(d["details"]) if isinstance(d["details"], str) else d["details"]
-                if details:
-                    key_info = ", ".join(f"{k}: {v}" for k, v in list(details.items())[:3])
-                    line += f" ({key_info})"
+                try:
+                    details = json.loads(d["details"]) if isinstance(d["details"], str) else d["details"]
+                    if isinstance(details, dict) and details:
+                        key_info = ", ".join(f"{k}: {v}" for k, v in list(details.items())[:3])
+                        line += f" ({key_info})"
+                    elif details:
+                        line += f" ({details})"
+                except (json.JSONDecodeError, TypeError, AttributeError):
+                    line += f" ({d['details']})"
             lines.append(line)
     else:
         lines.append("  (no deployments recorded yet)")
@@ -1313,10 +1383,20 @@ def _build_handoff_document(
             lines.append(f"  ✓ {d['title']}")
             lines.append(f"    Decision: {d['decision']}")
             lines.append(f"    Why: {d['reasoning']}")
-            alts = json.loads(d["alternatives"]) if isinstance(d["alternatives"], str) else d["alternatives"]
+            raw_alts = d["alternatives"]
+            try:
+                if isinstance(raw_alts, str):
+                    parsed = json.loads(raw_alts)
+                    alts = parsed if isinstance(parsed, list) else [parsed] if parsed else []
+                elif isinstance(raw_alts, list):
+                    alts = raw_alts
+                else:
+                    alts = [raw_alts] if raw_alts else []
+            except (json.JSONDecodeError, TypeError):
+                alts = [{"name": str(raw_alts)}] if raw_alts else []
             if alts:
                 rejected = ", ".join(
-                    a.get("name", "?") if isinstance(a, dict) else str(a) for a in alts
+                    a.get("name", str(a)) if isinstance(a, dict) else str(a) for a in alts
                 )
                 lines.append(f"    Rejected: {rejected}")
             lines.append("")
@@ -1395,14 +1475,20 @@ def _build_handoff_document(
             lines.append(f"  Session #{s['session_number']} ({date_str}): {s['title']}")
             lines.append(f"    Summary: {s['summary']}")
             
-            next_actions = json.loads(s["next_actions"]) if isinstance(s["next_actions"], str) else s["next_actions"]
+            try:
+                next_actions = json.loads(s["next_actions"]) if isinstance(s["next_actions"], str) else (s["next_actions"] or [])
+            except (json.JSONDecodeError, TypeError):
+                next_actions = [str(s["next_actions"])] if s["next_actions"] else []
             if next_actions:
                 lines.append(f"    Next actions: {json.dumps(next_actions)}")
-            
-            if s["context_for_next"]:
+
+            if s.get("context_for_next"):
                 lines.append(f"    ⚡ Context: {s['context_for_next']}")
-            
-            problems = json.loads(s["problems_hit"]) if isinstance(s["problems_hit"], str) else s["problems_hit"]
+
+            try:
+                problems = json.loads(s["problems_hit"]) if isinstance(s["problems_hit"], str) else (s["problems_hit"] or [])
+            except (json.JSONDecodeError, TypeError):
+                problems = [str(s["problems_hit"])] if s["problems_hit"] else []
             if problems:
                 lines.append(f"    Problems: {json.dumps(problems)}")
             lines.append("")
