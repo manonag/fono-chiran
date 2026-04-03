@@ -32,7 +32,7 @@ Port: 8004 (after voice-service:8001, api-service:8002, audit-agent:8003)
 import os
 import json
 import hashlib
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from enum import Enum
 from typing import Optional
 from contextlib import asynccontextmanager
@@ -295,6 +295,10 @@ CREATE TABLE IF NOT EXISTS tasks (
     result          TEXT,
     error           TEXT,
     created_by      TEXT DEFAULT 'claude_chat',
+    session_id      TEXT,                       -- which session claimed this task
+    last_heartbeat  TIMESTAMPTZ,                -- liveness signal from claiming session
+    verification_method  TEXT,                   -- how to verify: 'manual', 'api_call', 'test_run', etc.
+    verification_evidence TEXT,                  -- proof the task was completed correctly
     created_at      TIMESTAMPTZ DEFAULT now(),
     started_at      TIMESTAMPTZ,
     completed_at    TIMESTAMPTZ,
@@ -366,6 +370,23 @@ BEGIN
     
     IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='cost_events' AND column_name='project') THEN
         ALTER TABLE cost_events ADD COLUMN project TEXT NOT NULL DEFAULT 'fono';
+    END IF;
+END $$;
+
+-- Task locking & verification columns (idempotent)
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='tasks' AND column_name='session_id') THEN
+        ALTER TABLE tasks ADD COLUMN session_id TEXT;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='tasks' AND column_name='last_heartbeat') THEN
+        ALTER TABLE tasks ADD COLUMN last_heartbeat TIMESTAMPTZ;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='tasks' AND column_name='verification_method') THEN
+        ALTER TABLE tasks ADD COLUMN verification_method TEXT;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='tasks' AND column_name='verification_evidence') THEN
+        ALTER TABLE tasks ADD COLUMN verification_evidence TEXT;
     END IF;
 END $$;
 """
@@ -692,8 +713,8 @@ try:
                 doc_staleness = await pool.fetch("SELECT doc_id, issue, severity FROM doc_staleness WHERE status = 'open' ORDER BY severity DESC LIMIT 10")
                 doc_count = await pool.fetchval("SELECT count(*) FROM doc_nodes WHERE type = 'document' AND status = 'current'")
                 cost_total = await pool.fetchval("SELECT COALESCE(SUM(cost_usd), 0) FROM cost_events WHERE created_at > now() - interval '7 days'")
-                tasks = await pool.fetch("SELECT * FROM tasks WHERE status NOT IN ('done', 'failed') ORDER BY priority, created_at")
-                done_tasks = await pool.fetch("SELECT * FROM tasks WHERE status IN ('done', 'failed') ORDER BY completed_at DESC LIMIT 5")
+                tasks = await pool.fetch("SELECT * FROM tasks WHERE status NOT IN ('done', 'failed', 'cancelled') ORDER BY priority, created_at")
+                done_tasks = await pool.fetch("SELECT * FROM tasks WHERE status IN ('done', 'done_unverified', 'failed', 'cancelled') ORDER BY completed_at DESC LIMIT 5")
 
             handoff = _build_handoff_document(
                 deployments, decisions, sprint, sessions, questions, code_map,
@@ -975,6 +996,30 @@ try:
         except Exception as e:
             return f"Error listing projects: {e}"
 
+    @mcp_server.tool()
+    async def create_project(slug: str, name: str, description: str = "", metadata: str = "{}") -> str:
+        """Register a new project in CHIRAN. slug is the unique ID (lowercase, no spaces), name is display name, metadata is optional JSON."""
+        try:
+            pool = await _get_pool()
+            slug_clean = slug.lower().strip()
+            if not slug_clean:
+                return "Error: slug cannot be empty."
+            try:
+                parsed_meta = json.loads(metadata) if isinstance(metadata, str) and metadata.strip().startswith("{") else {}
+            except (json.JSONDecodeError, TypeError):
+                parsed_meta = {}
+            if not isinstance(parsed_meta, dict):
+                parsed_meta = {}
+            await pool.execute("""
+                INSERT INTO projects (id, name, description, metadata)
+                VALUES ($1, $2, $3, $4::jsonb)
+            """, slug_clean, name.strip(), description.strip(), json.dumps(parsed_meta))
+            return f"Project registered: {slug_clean} ({name}) — {description}"
+        except asyncpg.UniqueViolationError:
+            return f"Project '{slug}' already exists. Use a different slug."
+        except Exception as e:
+            return f"Error creating project: {e}"
+
     # ── TASK QUEUE MCP TOOLS ────────────────────────────────────────────────
 
     @mcp_server.tool()
@@ -1017,14 +1062,14 @@ try:
                     rows = await pool.fetch("SELECT * FROM tasks WHERE status = $1 AND project = $2 ORDER BY priority, created_at", status, project)
             else:
                 if project == "all":
-                    rows = await pool.fetch("SELECT * FROM tasks WHERE status NOT IN ('done', 'failed') ORDER BY priority, created_at")
+                    rows = await pool.fetch("SELECT * FROM tasks WHERE status NOT IN ('done', 'failed', 'cancelled') ORDER BY priority, created_at")
                 else:
-                    rows = await pool.fetch("SELECT * FROM tasks WHERE status NOT IN ('done', 'failed') AND project = $1 ORDER BY priority, created_at", project)
+                    rows = await pool.fetch("SELECT * FROM tasks WHERE status NOT IN ('done', 'failed', 'cancelled') AND project = $1 ORDER BY priority, created_at", project)
                 # Also fetch recently done (last 5)
                 if project == "all":
-                    done_rows = await pool.fetch("SELECT * FROM tasks WHERE status IN ('done', 'failed') ORDER BY completed_at DESC LIMIT 5")
+                    done_rows = await pool.fetch("SELECT * FROM tasks WHERE status IN ('done', 'done_unverified', 'failed', 'cancelled') ORDER BY completed_at DESC LIMIT 5")
                 else:
-                    done_rows = await pool.fetch("SELECT * FROM tasks WHERE status IN ('done', 'failed') AND project = $1 ORDER BY completed_at DESC LIMIT 5", project)
+                    done_rows = await pool.fetch("SELECT * FROM tasks WHERE status IN ('done', 'done_unverified', 'failed', 'cancelled') AND project = $1 ORDER BY completed_at DESC LIMIT 5", project)
                 rows = list(rows) + list(done_rows)
 
             if not rows:
@@ -1038,10 +1083,11 @@ try:
                     groups[s] = []
                 groups[s].append(t)
 
-            order = ["approved", "ready", "running", "draft", "blocked", "done", "failed"]
+            order = ["approved", "ready", "in_progress", "running", "draft", "blocked", "done_unverified", "done", "failed", "cancelled"]
             labels = {"approved": "APPROVED (ready to execute)", "ready": "READY (needs approval)",
-                      "running": "RUNNING", "draft": "DRAFT (needs review)",
-                      "blocked": "BLOCKED", "done": "RECENTLY DONE", "failed": "FAILED"}
+                      "in_progress": "IN PROGRESS", "running": "RUNNING", "draft": "DRAFT (needs review)",
+                      "blocked": "BLOCKED", "done_unverified": "DONE (unverified)",
+                      "done": "RECENTLY DONE", "failed": "FAILED", "cancelled": "CANCELLED"}
 
             lines = [f"TASK QUEUE — {project}", ""]
             for s in order:
@@ -1054,13 +1100,24 @@ try:
                     line = f"  [T-{t['id']}] {pe}: {prefix}{t['title']}"
                     if t.get("assigned_to"):
                         line += f" (assigned: {t['assigned_to']})"
-                    if s == "running" and t.get("started_at"):
+                    if s in ("running", "in_progress") and t.get("started_at"):
                         elapsed = datetime.now(timezone.utc) - t["started_at"]
                         hours = int(elapsed.total_seconds() // 3600)
                         if hours > 0:
                             line += f" started: {hours}h ago"
+                        if t.get("session_id"):
+                            line += f" [session: {t['session_id']}]"
+                        if t.get("last_heartbeat"):
+                            hb_elapsed = datetime.now(timezone.utc) - t["last_heartbeat"]
+                            hb_mins = int(hb_elapsed.total_seconds() // 60)
+                            if hb_mins > 30:
+                                line += f" ⚠️ STALE ({hb_mins}m since heartbeat)"
                     if s == "blocked" and t.get("blocked_reason"):
                         line += f" — {t['blocked_reason']}"
+                    if s == "done_unverified":
+                        line += " ⚠️ needs verification"
+                    if s == "done" and t.get("verification_evidence"):
+                        line += f" ✓ verified"
                     if s in ("done", "failed") and t.get("completed_at"):
                         elapsed = datetime.now(timezone.utc) - t["completed_at"]
                         hours = int(elapsed.total_seconds() // 3600)
@@ -1079,11 +1136,13 @@ try:
             return f"Error listing tasks: {e}"
 
     @mcp_server.tool()
-    async def update_task(task_id: str, status: str = "", result: str = "", error: str = "", brief: str = "", priority: int = 0, blocked_reason: str = "") -> str:
-        """Update a task's status, result, or other fields. task_id can be 'T-1' or '1'."""
+    async def update_task(task_id: int, status: str = "", result: str = "", error: str = "", brief: str = "", priority: int = 0, blocked_reason: str = "", verification_method: str = "", verification_evidence: str = "") -> str:
+        """Update a task's status, result, or other fields. task_id is the integer ID (e.g. 9 for T-9).
+        Status values: draft, ready, approved, in_progress, running, blocked, done, done_unverified, failed, cancelled.
+        Use done_unverified when work is complete but not yet verified. Set verification_method and verification_evidence when marking done."""
         try:
             pool = await _get_pool()
-            tid = int(task_id.replace("T-", ""))
+            tid = int(task_id)
 
             # Fetch current task
             task = await pool.fetchrow("SELECT * FROM tasks WHERE id = $1", tid)
@@ -1100,7 +1159,7 @@ try:
                 idx += 1
                 if status == "running":
                     sets.append("started_at = now()")
-                elif status in ("done", "failed"):
+                elif status in ("done", "failed", "cancelled"):
                     sets.append("completed_at = now()")
 
             if result:
@@ -1128,6 +1187,16 @@ try:
                 params.append(blocked_reason)
                 idx += 1
 
+            if verification_method:
+                sets.append(f"verification_method = ${idx}")
+                params.append(verification_method)
+                idx += 1
+
+            if verification_evidence:
+                sets.append(f"verification_evidence = ${idx}")
+                params.append(verification_evidence)
+                idx += 1
+
             params.append(tid)
             query = f"UPDATE tasks SET {', '.join(sets)} WHERE id = ${idx} RETURNING id, title, status, result"
             row = await pool.fetchrow(query, *params)
@@ -1145,10 +1214,64 @@ try:
                 parts.append(f"priority -> {priority}")
             if blocked_reason:
                 parts.append(f"blocked: {blocked_reason}")
+            if verification_method:
+                parts.append(f"verification: {verification_method}")
+            if verification_evidence:
+                parts.append(f"evidence: {verification_evidence[:80]}")
 
             return ", ".join(parts)
         except Exception as e:
             return f"Error updating task: {e}"
+
+    @mcp_server.tool()
+    async def claim_task(task_id: int, session_id: str) -> str:
+        """Claim a task for the current session. Sets status to in_progress, records session_id and started_at.
+        Fails if task is already claimed by another session (unless stale — no heartbeat for 30+ min)."""
+        try:
+            pool = await _get_pool()
+            task = await pool.fetchrow("SELECT * FROM tasks WHERE id = $1", task_id)
+            if not task:
+                return f"Task T-{task_id} not found."
+
+            # Check if already claimed by another active session
+            if task["status"] == "in_progress" and task.get("session_id"):
+                last_hb = task.get("last_heartbeat")
+                if last_hb:
+                    stale_threshold = datetime.now(timezone.utc) - timedelta(minutes=30)
+                    if last_hb > stale_threshold and task["session_id"] != session_id:
+                        return f"Task T-{task_id} is locked by session {task['session_id']} (last heartbeat: {last_hb.strftime('%H:%M UTC')}). Wait or use update_task to force-release."
+
+            row = await pool.fetchrow("""
+                UPDATE tasks SET status = 'in_progress', session_id = $2, started_at = now(),
+                    last_heartbeat = now(), updated_at = now()
+                WHERE id = $1 RETURNING id, title, status
+            """, task_id, session_id)
+            return f"[{task['project']}] Task T-{row['id']} claimed: \"{row['title']}\" — session {session_id}"
+        except Exception as e:
+            return f"Error claiming task: {e}"
+
+    @mcp_server.tool()
+    async def heartbeat_task(task_id: int, session_id: str, progress: str = "") -> str:
+        """Send a heartbeat for a claimed task. Call periodically to keep the lock alive.
+        Optionally include a progress note."""
+        try:
+            pool = await _get_pool()
+            task = await pool.fetchrow("SELECT id, session_id, title, project FROM tasks WHERE id = $1", task_id)
+            if not task:
+                return f"Task T-{task_id} not found."
+            if task["session_id"] != session_id:
+                return f"Task T-{task_id} is not claimed by session {session_id}."
+
+            sets = ["last_heartbeat = now()", "updated_at = now()"]
+            params = [task_id]
+            if progress:
+                sets.append(f"result = $2")
+                params.append(f"[progress] {progress}")
+            await pool.execute(
+                f"UPDATE tasks SET {', '.join(sets)} WHERE id = $1", *params)
+            return f"Heartbeat OK for T-{task_id}" + (f" — {progress}" if progress else "")
+        except Exception as e:
+            return f"Error sending heartbeat: {e}"
 
     # Mount MCP Streamable HTTP app
     # FastMCP's streamable_http_app() creates routes at /mcp internally
@@ -1170,7 +1293,8 @@ EXPECTED_MCP_TOOLS = [
     "generate_handoff", "save_session", "record_decision", "list_decisions",
     "list_sprint", "create_sprint_item", "update_sprint_item", "delete_sprint_item",
     "list_deployments", "list_open_questions", "search_docs", "get_doc_manifest",
-    "list_projects", "create_task", "list_tasks", "update_task",
+    "list_projects", "create_project",
+    "create_task", "list_tasks", "update_task", "claim_task", "heartbeat_task",
 ]
 
 @app.get("/health")
@@ -1300,10 +1424,10 @@ async def generate_handoff(
 
     # 9. Task queue
     active_tasks = await pool.fetch(
-        "SELECT * FROM tasks WHERE status NOT IN ('done', 'failed') ORDER BY priority, created_at"
+        "SELECT * FROM tasks WHERE status NOT IN ('done', 'failed', 'cancelled') ORDER BY priority, created_at"
     )
     done_tasks = await pool.fetch(
-        "SELECT * FROM tasks WHERE status IN ('done', 'failed') ORDER BY completed_at DESC LIMIT 5"
+        "SELECT * FROM tasks WHERE status IN ('done', 'done_unverified', 'failed', 'cancelled') ORDER BY completed_at DESC LIMIT 5"
     )
 
     # Build the handoff document
