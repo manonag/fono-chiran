@@ -307,6 +307,34 @@ CREATE TABLE IF NOT EXISTS tasks (
 
 CREATE INDEX IF NOT EXISTS idx_tasks_project_status ON tasks(project, status);
 CREATE INDEX IF NOT EXISTS idx_tasks_priority ON tasks(priority);
+
+-- PRINCIPLES: Platform-wide and project-specific rules
+CREATE TABLE IF NOT EXISTS principles (
+    id              SERIAL PRIMARY KEY,
+    project         TEXT REFERENCES projects(id),   -- NULL = platform-wide
+    category        TEXT NOT NULL DEFAULT 'workflow',
+    text            TEXT NOT NULL,
+    active          BOOLEAN NOT NULL DEFAULT true,
+    created_at      TIMESTAMPTZ DEFAULT now(),
+    retired_at      TIMESTAMPTZ
+);
+
+CREATE INDEX IF NOT EXISTS idx_principles_active ON principles(active);
+CREATE INDEX IF NOT EXISTS idx_principles_project ON principles(project);
+
+-- ARCHITECTURE FACTS: Living knowledge about system components
+CREATE TABLE IF NOT EXISTS architecture_facts (
+    id              SERIAL PRIMARY KEY,
+    project         TEXT NOT NULL DEFAULT 'fono' REFERENCES projects(id),
+    domain          TEXT NOT NULL DEFAULT 'infrastructure',
+    summary         TEXT NOT NULL,                  -- short, auto-injected in handoffs
+    detail          TEXT,                            -- longer, on-demand
+    detail_level    TEXT NOT NULL DEFAULT 'summary', -- summary | detail
+    updated_at      TIMESTAMPTZ DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_arch_facts_project ON architecture_facts(project);
+CREATE INDEX IF NOT EXISTS idx_arch_facts_domain ON architecture_facts(domain);
 """
 
 # Migration SQL — adds project column to existing tables if not present
@@ -389,6 +417,31 @@ BEGIN
         ALTER TABLE tasks ADD COLUMN verification_evidence TEXT;
     END IF;
 END $$;
+
+-- Principles and architecture_facts tables (idempotent — also in SCHEMA_SQL but safe to repeat)
+CREATE TABLE IF NOT EXISTS principles (
+    id              SERIAL PRIMARY KEY,
+    project         TEXT REFERENCES projects(id),
+    category        TEXT NOT NULL DEFAULT 'workflow',
+    text            TEXT NOT NULL,
+    active          BOOLEAN NOT NULL DEFAULT true,
+    created_at      TIMESTAMPTZ DEFAULT now(),
+    retired_at      TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_principles_active ON principles(active);
+CREATE INDEX IF NOT EXISTS idx_principles_project ON principles(project);
+
+CREATE TABLE IF NOT EXISTS architecture_facts (
+    id              SERIAL PRIMARY KEY,
+    project         TEXT NOT NULL DEFAULT 'fono' REFERENCES projects(id),
+    domain          TEXT NOT NULL DEFAULT 'infrastructure',
+    summary         TEXT NOT NULL,
+    detail          TEXT,
+    detail_level    TEXT NOT NULL DEFAULT 'summary',
+    updated_at      TIMESTAMPTZ DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_arch_facts_project ON architecture_facts(project);
+CREATE INDEX IF NOT EXISTS idx_arch_facts_domain ON architecture_facts(domain);
 """
 
 
@@ -703,6 +756,10 @@ try:
                     "SELECT * FROM tasks WHERE project = $1 AND status NOT IN ('done', 'failed') ORDER BY priority, created_at", project)
                 done_tasks = await pool.fetch(
                     "SELECT * FROM tasks WHERE project = $1 AND status IN ('done', 'failed') ORDER BY completed_at DESC LIMIT 5", project)
+                principles = await pool.fetch(
+                    "SELECT id, project, category, text FROM principles WHERE active = true AND (project = $1 OR project IS NULL) ORDER BY category, id", project)
+                arch_facts = await pool.fetch(
+                    "SELECT id, domain, summary FROM architecture_facts WHERE project = $1 ORDER BY domain, id", project)
             else:
                 deployments = await pool.fetch("SELECT component, status, environment, version, details, deployed_at FROM deployment_state ORDER BY project, component")
                 decisions = await pool.fetch("SELECT title, category, decision, reasoning, alternatives, status FROM decisions WHERE status = 'active' ORDER BY decided_at DESC")
@@ -715,11 +772,14 @@ try:
                 cost_total = await pool.fetchval("SELECT COALESCE(SUM(cost_usd), 0) FROM cost_events WHERE created_at > now() - interval '7 days'")
                 tasks = await pool.fetch("SELECT * FROM tasks WHERE status NOT IN ('done', 'failed', 'cancelled') ORDER BY priority, created_at")
                 done_tasks = await pool.fetch("SELECT * FROM tasks WHERE status IN ('done', 'done_unverified', 'failed', 'cancelled') ORDER BY completed_at DESC LIMIT 5")
+                principles = await pool.fetch("SELECT id, project, category, text FROM principles WHERE active = true ORDER BY category, id")
+                arch_facts = await pool.fetch("SELECT id, project, domain, summary FROM architecture_facts ORDER BY project, domain, id")
 
             handoff = _build_handoff_document(
                 deployments, decisions, sprint, sessions, questions, code_map,
                 doc_staleness, doc_count, float(cost_total), project_name=project.upper(),
                 tasks=list(tasks) + list(done_tasks),
+                principles=principles, arch_facts=arch_facts,
             )
             return handoff
         except Exception as e:
@@ -1020,6 +1080,153 @@ try:
         except Exception as e:
             return f"Error creating project: {e}"
 
+    # ── PRINCIPLES MCP TOOLS ─────────────────────────────────────────────────
+
+    @mcp_server.tool()
+    async def add_principle(text: str, project: str = "", category: str = "workflow") -> str:
+        """Add a principle. project='' for platform-wide. Categories: infrastructure, code_style, deployment, workflow, vendor, security_governance, design."""
+        try:
+            pool = await _get_pool()
+            proj = project.strip() if project.strip() else None
+            valid_cats = ("infrastructure", "code_style", "deployment", "workflow", "vendor", "security_governance", "design")
+            if category not in valid_cats:
+                return f"Invalid category '{category}'. Must be one of: {', '.join(valid_cats)}"
+            row = await pool.fetchrow("""
+                INSERT INTO principles (project, category, text) VALUES ($1, $2, $3)
+                RETURNING id, project, category
+            """, proj, category, text.strip())
+            scope = f"[{row['project']}]" if row['project'] else "[platform-wide]"
+            return f"Principle #{row['id']} added {scope} ({row['category']}): {text[:80]}"
+        except Exception as e:
+            return f"Error adding principle: {e}"
+
+    @mcp_server.tool()
+    async def list_principles(project: str = "", category: str = "") -> str:
+        """List active principles. project='' for platform-wide, 'all' for everything. Filter by category optionally."""
+        try:
+            pool = await _get_pool()
+            if project == "all":
+                if category:
+                    rows = await pool.fetch("SELECT id, project, category, text FROM principles WHERE active = true AND category = $1 ORDER BY category, id", category)
+                else:
+                    rows = await pool.fetch("SELECT id, project, category, text FROM principles WHERE active = true ORDER BY category, id")
+            elif project:
+                if category:
+                    rows = await pool.fetch("SELECT id, project, category, text FROM principles WHERE active = true AND project = $1 AND category = $2 ORDER BY id", project, category)
+                else:
+                    rows = await pool.fetch("SELECT id, project, category, text FROM principles WHERE active = true AND project = $1 ORDER BY category, id", project)
+            else:
+                if category:
+                    rows = await pool.fetch("SELECT id, project, category, text FROM principles WHERE active = true AND project IS NULL AND category = $1 ORDER BY id", category)
+                else:
+                    rows = await pool.fetch("SELECT id, project, category, text FROM principles WHERE active = true AND project IS NULL ORDER BY category, id")
+            if not rows:
+                return f"No active principles found."
+            lines = [f"Active Principles ({len(rows)}):"]
+            current_cat = ""
+            for p in rows:
+                if p['category'] != current_cat:
+                    current_cat = p['category']
+                    lines.append(f"\n  [{current_cat.upper()}]")
+                scope = f"[{p['project']}] " if p['project'] else ""
+                lines.append(f"  #{p['id']}: {scope}{p['text']}")
+            return "\n".join(lines)
+        except Exception as e:
+            return f"Error listing principles: {e}"
+
+    @mcp_server.tool()
+    async def retire_principle(principle_id: int) -> str:
+        """Retire (deactivate) a principle by ID. It remains in the DB but won't appear in handoffs."""
+        try:
+            pool = await _get_pool()
+            row = await pool.fetchrow(
+                "UPDATE principles SET active = false, retired_at = now() WHERE id = $1 RETURNING id, text",
+                principle_id)
+            if not row:
+                return f"Principle #{principle_id} not found."
+            return f"Principle #{row['id']} retired: {row['text'][:80]}"
+        except Exception as e:
+            return f"Error retiring principle: {e}"
+
+    # ── ARCHITECTURE FACTS MCP TOOLS ───────────────────────────────────────
+
+    @mcp_server.tool()
+    async def add_architecture_fact(project: str, domain: str, summary: str, detail: str = "") -> str:
+        """Add an architecture fact. Domains: voice_pipeline, dashboard, chiran, iad, agent_platform, infrastructure, landing_page, frontend."""
+        try:
+            pool = await _get_pool()
+            valid_domains = ("voice_pipeline", "dashboard", "chiran", "iad", "agent_platform", "infrastructure", "landing_page", "frontend")
+            if domain not in valid_domains:
+                return f"Invalid domain '{domain}'. Must be one of: {', '.join(valid_domains)}"
+            row = await pool.fetchrow("""
+                INSERT INTO architecture_facts (project, domain, summary, detail, detail_level)
+                VALUES ($1, $2, $3, $4, $5) RETURNING id
+            """, project, domain, summary.strip(), detail.strip() or None, "detail" if detail.strip() else "summary")
+            return f"Architecture fact #{row['id']} added [{project}/{domain}]: {summary[:80]}"
+        except Exception as e:
+            return f"Error adding architecture fact: {e}"
+
+    @mcp_server.tool()
+    async def list_architecture_facts(project: str = "fono", domain: str = "") -> str:
+        """List architecture facts. Use project='all' for cross-project. Filter by domain optionally."""
+        try:
+            pool = await _get_pool()
+            if project == "all":
+                if domain:
+                    rows = await pool.fetch("SELECT id, project, domain, summary, detail FROM architecture_facts WHERE domain = $1 ORDER BY project, domain, id", domain)
+                else:
+                    rows = await pool.fetch("SELECT id, project, domain, summary, detail FROM architecture_facts ORDER BY project, domain, id")
+            else:
+                if domain:
+                    rows = await pool.fetch("SELECT id, project, domain, summary, detail FROM architecture_facts WHERE project = $1 AND domain = $2 ORDER BY id", project, domain)
+                else:
+                    rows = await pool.fetch("SELECT id, project, domain, summary, detail FROM architecture_facts WHERE project = $1 ORDER BY domain, id", project)
+            if not rows:
+                return f"No architecture facts found."
+            lines = [f"Architecture Facts ({len(rows)}):"]
+            current_domain = ""
+            for f in rows:
+                if f['domain'] != current_domain:
+                    current_domain = f['domain']
+                    proj_label = f" [{f['project']}]" if project == "all" else ""
+                    lines.append(f"\n  [{current_domain.upper()}]{proj_label}")
+                lines.append(f"  #{f['id']}: {f['summary']}")
+                if f['detail']:
+                    lines.append(f"       Detail: {f['detail'][:120]}")
+            return "\n".join(lines)
+        except Exception as e:
+            return f"Error listing architecture facts: {e}"
+
+    @mcp_server.tool()
+    async def update_architecture_fact(fact_id: int, summary: str = "", detail: str = "") -> str:
+        """Update an architecture fact's summary and/or detail."""
+        try:
+            pool = await _get_pool()
+            existing = await pool.fetchrow("SELECT * FROM architecture_facts WHERE id = $1", fact_id)
+            if not existing:
+                return f"Architecture fact #{fact_id} not found."
+            sets = ["updated_at = now()"]
+            params = []
+            idx = 1
+            if summary:
+                sets.append(f"summary = ${idx}")
+                params.append(summary.strip())
+                idx += 1
+            if detail:
+                sets.append(f"detail = ${idx}")
+                params.append(detail.strip())
+                idx += 1
+                sets.append(f"detail_level = 'detail'")
+            if not params:
+                return "No fields to update. Provide summary and/or detail."
+            params.append(fact_id)
+            row = await pool.fetchrow(
+                f"UPDATE architecture_facts SET {', '.join(sets)} WHERE id = ${idx} RETURNING id, summary",
+                *params)
+            return f"Architecture fact #{row['id']} updated: {row['summary'][:80]}"
+        except Exception as e:
+            return f"Error updating architecture fact: {e}"
+
     # ── TASK QUEUE MCP TOOLS ────────────────────────────────────────────────
 
     @mcp_server.tool()
@@ -1294,6 +1501,8 @@ EXPECTED_MCP_TOOLS = [
     "list_sprint", "create_sprint_item", "update_sprint_item", "delete_sprint_item",
     "list_deployments", "list_open_questions", "search_docs", "get_doc_manifest",
     "list_projects", "create_project",
+    "add_principle", "list_principles", "retire_principle",
+    "add_architecture_fact", "list_architecture_facts", "update_architecture_fact",
     "create_task", "list_tasks", "update_task", "claim_task", "heartbeat_task",
 ]
 
@@ -1458,7 +1667,7 @@ async def generate_handoff(
 def _build_handoff_document(
     deployments, decisions, sprint, sessions, questions, code_map,
     doc_staleness=None, doc_count=0, cost_7d=0.0, project_name="FONO",
-    tasks=None,
+    tasks=None, principles=None, arch_facts=None,
 ) -> str:
     """Build the structured handoff document for Claude."""
     
@@ -1499,6 +1708,37 @@ def _build_handoff_document(
         lines.append("  (no deployments recorded yet)")
     lines.append("")
     
+    # --- PRINCIPLES (Always follow these) ---
+    lines.append("## PRINCIPLES (Always follow these)")
+    lines.append("")
+    if principles:
+        current_cat = ""
+        for p in principles:
+            if p['category'] != current_cat:
+                current_cat = p['category']
+                lines.append(f"  [{current_cat.upper()}]")
+            scope = f"[{p['project']}] " if p.get('project') else ""
+            lines.append(f"  — {scope}{p['text']}")
+        lines.append("")
+    else:
+        lines.append("  (no principles recorded)")
+        lines.append("")
+
+    # --- ARCHITECTURE FACTS (System knowledge) ---
+    lines.append("## ARCHITECTURE (How things work)")
+    lines.append("")
+    if arch_facts:
+        current_domain = ""
+        for f in arch_facts:
+            if f['domain'] != current_domain:
+                current_domain = f['domain']
+                lines.append(f"  [{current_domain.upper()}]")
+            lines.append(f"  • {f['summary']}")
+        lines.append("")
+    else:
+        lines.append("  (no architecture facts recorded)")
+        lines.append("")
+
     # --- DECISIONS (DO NOT RE-SUGGEST) ---
     lines.append("## DECISIONS MADE (Do NOT re-suggest alternatives)")
     lines.append("")
@@ -2487,6 +2727,119 @@ async def seed_current_state(pool: asyncpg.Pool = Depends(get_db)):
             "documents": len(docs),
             "edges": len([e for e in edges if e[0] in doc_node_ids and e[1] in doc_node_ids]),
         },
+    }
+
+
+# =============================================================================
+# SEED: PRINCIPLES + ARCHITECTURE FACTS
+# =============================================================================
+
+@app.post("/api/v1/seed/principles")
+async def seed_principles_and_arch_facts(pool: asyncpg.Pool = Depends(get_db)):
+    """Seed principles and architecture facts. Idempotent — uses ON CONFLICT DO NOTHING on text/summary."""
+
+    # --- 20 PRINCIPLES (extracted from decisions + learned patterns) ---
+    principles = [
+        # (project, category, text)
+        (None, "workflow", "Em dash rule — use surgical, targeted patches. Never rewrite working systems. Fix only what's broken."),
+        (None, "workflow", "CHIRAN health is P0. If MCP tools fail, fix them before any product work."),
+        (None, "workflow", "Commit after each logical chunk. Never batch multiple unrelated changes."),
+        (None, "workflow", "Every session must end with save_session. Every session must start with generate_handoff."),
+        (None, "workflow", "When a tool call fails, diagnose and fix the tool — don't work around it."),
+        (None, "code_style", "No component libraries (no shadcn, MUI, Chakra). Tailwind utility classes only."),
+        (None, "code_style", "No Redux/Zustand. React hooks only (useState, useEffect, useReducer)."),
+        (None, "code_style", "TypeScript strict mode. No 'any' type. Always type properly."),
+        (None, "code_style", "Functional components only. Named exports for components, default for pages."),
+        (None, "deployment", "Railway for all backend deployments. Vercel for frontend. Doppler for secrets."),
+        (None, "deployment", "Every deployment must be verified via /health endpoint before marking done."),
+        (None, "infrastructure", "PostgreSQL for all persistence. No MongoDB, no DynamoDB, no Firebase."),
+        (None, "infrastructure", "SSE (Server-Sent Events) for real-time, not WebSockets — simpler, stateless, Railway-compatible."),
+        (None, "vendor", "ElevenLabs for TTS. Twilio for telephony. Cloudflare R2 for recording storage."),
+        (None, "vendor", "Supabase Auth for authentication (Google OAuth + email/password)."),
+        (None, "security_governance", "Never hardcode tenant IDs, API keys, or secrets in source code."),
+        (None, "security_governance", "All API endpoints must validate tenant ownership before returning data."),
+        (None, "design", "Fono brand: Terra #E0602A primary, Cream #FDF0E8 backgrounds, Plus Jakarta Sans font."),
+        (None, "design", "The Fono logo 'o' is a pulsing circle — canvas-measured, never an image file."),
+        ("fono", "workflow", "Fono MVP targets South Indian Telugu restaurants in California. Stay focused on this niche."),
+    ]
+
+    p_count = 0
+    for proj, cat, text in principles:
+        try:
+            await pool.execute("""
+                INSERT INTO principles (project, category, text)
+                SELECT $1, $2, $3 WHERE NOT EXISTS (
+                    SELECT 1 FROM principles WHERE text = $3 AND active = true
+                )
+            """, proj, cat, text)
+            p_count += 1
+        except Exception:
+            pass  # skip duplicates
+
+    # --- 21 ARCHITECTURE FACTS ---
+    arch_facts = [
+        # (project, domain, summary, detail)
+        ("fono", "voice_pipeline", "Twilio handles inbound calls → SIP → our FastAPI webhook at /api/v1/calls/bridge",
+         "Phase 0: pre-recorded ElevenLabs greeting (Zara voice). Phase 1 will add real-time STT/TTS via Twilio Media Streams WebSocket."),
+        ("fono", "voice_pipeline", "Recordings stored in Cloudflare R2, URLs saved in calls.recording_url",
+         "R2 bucket: fono-recordings. Presigned URLs for playback. WhatsApp notification sent to owner on new recording."),
+        ("fono", "voice_pipeline", "Call lifecycle: ringing → in_progress → completed/no_answer/missed",
+         "StatusCallback from Twilio hits our bridge endpoint. Events published to SSE stream for real-time dashboard updates."),
+        ("fono", "voice_pipeline", "Missed call recovery: 5-minute countdown timer in kiosk, owner can call back",
+         "Kiosk shows countdown for missed calls. If owner calls back within window, status changes to 'recovered'."),
+        ("fono", "dashboard", "Next.js 14 App Router, deployed on Vercel, talks to FastAPI backend via NEXT_PUBLIC_API_URL",
+         "Two surfaces: /dashboard (owner analytics) and /kiosk (restaurant counter display). Both share components."),
+        ("fono", "dashboard", "SSE real-time updates via EventSource to /api/v1/events/calls with exponential backoff reconnection",
+         "use-call-events.ts hook manages SSE connection. Reconnects on failure with exponential backoff (1s, 2s, 4s... max 30s)."),
+        ("fono", "dashboard", "Auth: Supabase Google OAuth + email/password. Session stored in cookies, validated server-side",
+         "Middleware checks auth on /dashboard routes. /signup and /login are public. Tenant mapping in user_tenants table."),
+        ("fono", "dashboard", "First tenant: Spice Garden, UUID 5c59ba59-2bf0-40a4-b15a-2d96c509ef29",
+         "Located in Sunnyvale, CA. South Indian Telugu restaurant. Owner uses WhatsApp for notifications."),
+        ("fono", "frontend", "Tailwind CSS utility-first. Brand colors: Terra #E0602A, Cream #FDF0E8, Ink #1E0E00",
+         "Plus Jakarta Sans font (weights 300-800). Recharts for charts. cn() utility for conditional classnames."),
+        ("fono", "frontend", "Logo component uses hidden canvas measureText() to position the pulsing 'o' circle precisely",
+         "SVG-based animation with 3 expanding pulse circles. Breathing opacity on outer ring. Size prop controls all dimensions."),
+        ("fono", "infrastructure", "Backend: FastAPI on Railway, PostgreSQL on Railway, Doppler for env vars",
+         "Production URL: fono-backend-production.up.railway.app. Health check at /health."),
+        ("fono", "infrastructure", "API versioned at /api/v1/. Key endpoints: /dashboard/{tenant_id}/summary, /calls, /events/calls (SSE)",
+         "Pagination via ?page=1&per_page=20. Status filter via ?status=completed|missed|recovered."),
+        ("chiran", "chiran", "CHIRAN is the context backbone — MCP server + REST API on Railway",
+         "FastMCP stateless HTTP transport mounted at /mcp-server/mcp. 25 MCP tools for full project lifecycle management."),
+        ("chiran", "chiran", "CHIRAN schema: projects, sessions, decisions, sprint_items, tasks, deployment_state, principles, architecture_facts",
+         "Plus doc_nodes, doc_edges, doc_versions, doc_staleness, open_questions, code_state, cost_events. 18+ tables."),
+        ("chiran", "chiran", "generate_handoff is the most critical tool — loads full project context at session start",
+         "Includes: deployments, principles, architecture facts, decisions, sprint items, tasks, sessions, questions, doc health, costs."),
+        ("chiran", "infrastructure", "Deployed on Railway from manonag/fono-chiran repo, auto-deploys on push to main",
+         "Health endpoint at /health verifies DB connectivity, MCP tool registration (25 expected), and table existence."),
+        ("platform", "agent_platform", "Multi-project CHIRAN manages 8 projects: fono, salespilot, platform, askben, cravo, passportease, examprep, chiran",
+         "Each project has isolated sprint items, tasks, decisions, sessions. Principles can be platform-wide (project=NULL) or project-specific."),
+        ("platform", "iad", "IAD (Intelligent Agent Dispatch) is planned — will route tasks to specialized agents",
+         "Agent types: claude_code, claude_chat, prd_agent, architecture_agent, sprint_agent, compliance_agent. Not yet built."),
+        ("salespilot", "infrastructure", "SalesPilot: field sales route optimization. FastAPI + PostgreSQL + XGBoost + OR-Tools",
+         "SJSU DL project context (Kanaka). Planned, not yet in development."),
+        ("fono", "landing_page", "fono.services is the marketing landing page on Vercel",
+         "Signup flow with restaurant onboarding. OG image needed for WhatsApp link previews."),
+        ("fono", "landing_page", "Signup paths: Path A (AI assistant pitch) and Path B+C hybrid (quick start + guided setup)",
+         "Design approved v5 for Settings Path A/B onboarding. Currently in task queue as T-10, T-11."),
+    ]
+
+    af_count = 0
+    for proj, domain, summary, detail in arch_facts:
+        try:
+            await pool.execute("""
+                INSERT INTO architecture_facts (project, domain, summary, detail, detail_level)
+                SELECT $1, $2, $3, $4, 'detail' WHERE NOT EXISTS (
+                    SELECT 1 FROM architecture_facts WHERE summary = $3
+                )
+            """, proj, domain, summary, detail)
+            af_count += 1
+        except Exception:
+            pass  # skip duplicates
+
+    return {
+        "status": "seeded",
+        "principles_processed": p_count,
+        "architecture_facts_processed": af_count,
     }
 
 
