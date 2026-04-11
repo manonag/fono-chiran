@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": []
+  },
+  "mcpServers": {
+    "chiran": {
+      "type": "url",
+      "url": "https://fono-chiran-production.up.railway.app/mcp-server/mcp"
+    }
+  }
+}
