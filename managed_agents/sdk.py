@@ -109,7 +109,7 @@ class ManagedAgentsClient:
         payload: dict = {
             "name": name,
             "model": model,
-            "instructions": system_prompt,
+            "description": system_prompt,
         }
         if tools:
             payload["tools"] = tools
