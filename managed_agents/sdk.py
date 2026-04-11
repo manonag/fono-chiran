@@ -157,9 +157,9 @@ class ManagedAgentsClient:
         title: Optional[str] = None,
     ) -> dict:
         """Create a new session for an agent."""
-        payload: dict = {"agent_id": agent_id}
+        payload: dict = {"agent": agent_id}
         if environment_id:
-            payload["environment_id"] = environment_id
+            payload["environment"] = environment_id
         if title:
             payload["title"] = title
 
