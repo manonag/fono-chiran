@@ -279,6 +279,7 @@ async def dispatch_task(req: DispatchRequest, pool: asyncpg.Pool = Depends(get_d
 
     except requests.exceptions.HTTPError as e:
         status = e.response.status_code if e.response is not None else 502
+        url = str(e.response.url) if e.response is not None else "unknown"
         try:
             body = e.response.json() if e.response is not None else {}
         except (ValueError, AttributeError):
@@ -288,6 +289,7 @@ async def dispatch_task(req: DispatchRequest, pool: asyncpg.Pool = Depends(get_d
             detail={
                 "error": "Managed Agents API error",
                 "api_status": status,
+                "api_url": url,
                 "api_response": body,
             },
         )
