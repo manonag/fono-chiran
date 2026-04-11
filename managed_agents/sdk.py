@@ -177,11 +177,12 @@ class ManagedAgentsClient:
     def send_message(self, session_id: str, content: str) -> dict:
         """Send a user message to a session and return the response."""
         payload = {
+            "session_id": session_id,
             "role": "user",
             "content": content,
         }
         resp = self.session.post(
-            f"{API_BASE}/sessions/{session_id}/turns",
+            f"{API_BASE}/turns",
             json=payload,
         )
         resp.raise_for_status()
