@@ -11,6 +11,7 @@ import os
 from typing import Optional
 
 import asyncpg
+import requests
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
@@ -225,39 +226,40 @@ async def dispatch_task(req: DispatchRequest, pool: asyncpg.Pool = Depends(get_d
     # Create client
     client = ManagedAgentsClient(api_key=api_key)
 
-    # Create agent
-    template = SDLC_AGENT_TEMPLATES[req.agent_template]
-    agent = client.create_agent(
-        name=template["name"],
-        system_prompt=template["system"],
-        model="claude-sonnet-4-6",
-        tools=[{"type": "agent_toolset_20260401"}],
-        mcp_servers=[
-            {
-                "type": "url",
-                "url": CHIRAN_MCP_URL,
-                "name": "chiran",
-            }
-        ],
-        skill_ids=skill_ids if skill_ids else None,
-    )
+    try:
+        # Create agent
+        template = SDLC_AGENT_TEMPLATES[req.agent_template]
+        agent = client.create_agent(
+            name=template["name"],
+            system_prompt=template["system"],
+            model="claude-sonnet-4-6",
+            tools=[{"type": "agent_toolset_20260401"}],
+            mcp_servers=[
+                {
+                    "type": "url",
+                    "url": CHIRAN_MCP_URL,
+                    "name": "chiran",
+                }
+            ],
+            skill_ids=skill_ids if skill_ids else None,
+        )
 
-    # Create environment
-    env_template = ENVIRONMENT_TEMPLATES[req.environment]
-    env = client.create_environment(
-        name=env_template["name"],
-        packages=env_template.get("packages"),
-    )
+        # Create environment
+        env_template = ENVIRONMENT_TEMPLATES[req.environment]
+        env = client.create_environment(
+            name=env_template["name"],
+            packages=env_template.get("packages"),
+        )
 
-    # Create session
-    session = client.create_session(
-        agent_id=agent["id"],
-        environment_id=env["id"],
-        title=f"CHIRAN: {req.project} - {req.task[:40]}",
-    )
+        # Create session
+        session = client.create_session(
+            agent_id=agent["id"],
+            environment_id=env["id"],
+            title=f"CHIRAN: {req.project} - {req.task[:40]}",
+        )
 
-    # Build message with CHIRAN context layers
-    message = f"""## Project Context ({req.project})
+        # Build message with CHIRAN context layers
+        message = f"""## Project Context ({req.project})
 {handoff}
 
 ## Active Decisions
@@ -270,8 +272,28 @@ async def dispatch_task(req: DispatchRequest, pool: asyncpg.Pool = Depends(get_d
 {req.task}
 """
 
-    # Send task
-    client.send_message(session["id"], message)
+        # Send task
+        client.send_message(session["id"], message)
+
+    except requests.exceptions.HTTPError as e:
+        status = e.response.status_code if e.response is not None else 502
+        try:
+            body = e.response.json() if e.response is not None else {}
+        except (ValueError, AttributeError):
+            body = {"raw": e.response.text if e.response is not None else str(e)}
+        raise HTTPException(
+            status_code=status,
+            detail={
+                "error": "Managed Agents API error",
+                "api_status": status,
+                "api_response": body,
+            },
+        )
+    except requests.exceptions.ConnectionError as e:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Cannot reach Managed Agents API: {e}",
+        )
 
     return DispatchResponse(
         session_id=session["id"],
