@@ -235,7 +235,7 @@ async def dispatch_task(req: DispatchRequest, pool: asyncpg.Pool = Depends(get_d
             model="claude-sonnet-4-6",
             tools=[
                 {"type": "agent_toolset_20260401"},
-                {"type": "mcp_toolset", "server_name": "chiran"},
+                {"type": "mcp_toolset", "mcp_server_name": "chiran"},
             ],
             mcp_servers=[
                 {
