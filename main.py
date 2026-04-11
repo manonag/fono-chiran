@@ -652,6 +652,9 @@ async def lifespan(app: FastAPI):
         await conn.execute(MIGRATION_SQL)
         # Then run full schema (for fresh installs)
         await conn.execute(SCHEMA_SQL)
+    # Share pool with managed_agents router
+    from managed_agents.router import set_db_pool
+    set_db_pool(db_pool)
     print(f"🧠 CHIRAN Context Service v0.3 (multi-project) ready on port {PORT}")
     
     # Start MCP session manager if available
@@ -678,6 +681,10 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Managed Agents router (dispatch tasks to Anthropic Managed Agents)
+from managed_agents.router import router as managed_agents_router
+app.include_router(managed_agents_router)
 
 
 # =============================================================================

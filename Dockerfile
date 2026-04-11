@@ -6,6 +6,9 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY main.py .
+COPY managed_agents/ managed_agents/
+COPY scripts/ scripts/
+COPY skills_registry.json .
 
 # Railway sets PORT env var, but we default to 8004
 ENV CHIRAN_PORT=8004
