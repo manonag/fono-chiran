@@ -181,7 +181,7 @@ class ManagedAgentsClient:
             "content": content,
         }
         resp = self.session.post(
-            f"{API_BASE}/sessions/{session_id}/messages",
+            f"{API_BASE}/sessions/{session_id}/turns",
             json=payload,
         )
         resp.raise_for_status()
