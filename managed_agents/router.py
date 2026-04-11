@@ -251,7 +251,6 @@ async def dispatch_task(req: DispatchRequest, pool: asyncpg.Pool = Depends(get_d
         env_template = ENVIRONMENT_TEMPLATES[req.environment]
         env = client.create_environment(
             name=env_template["name"],
-            packages=env_template.get("packages"),
         )
 
         # Create session

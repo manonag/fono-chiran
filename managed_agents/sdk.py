@@ -137,12 +137,12 @@ class ManagedAgentsClient:
     def create_environment(
         self,
         name: str,
-        packages: Optional[list] = None,
+        setup_commands: Optional[list] = None,
     ) -> dict:
         """Create a sandboxed execution environment."""
         payload: dict = {"name": name}
-        if packages:
-            payload["packages"] = packages
+        if setup_commands:
+            payload["setup_commands"] = setup_commands
 
         resp = self.session.post(f"{API_BASE}/environments", json=payload)
         resp.raise_for_status()
