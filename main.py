@@ -85,15 +85,38 @@ CREATE TABLE IF NOT EXISTS projects (
     created_at      TIMESTAMPTZ DEFAULT now()
 );
 
--- Seed default projects if not exist
-INSERT INTO projects (id, name, description, metadata) VALUES
-    ('fono', 'Fono', 'AI Voice Assistant for South Indian Telugu restaurants in California',
-     '{"repo": "manonag/fono-backend", "frontend": "manonag/fono-frontend", "stack": "FastAPI + PostgreSQL + Twilio + Railway"}'::jsonb),
-    ('salespilot', 'SalesPilot', 'Field sales route optimization with ML-predicted deal priority scoring',
-     '{"repo": "planned", "stack": "FastAPI + PostgreSQL + XGBoost + OR-Tools", "context": "Kanaka SJSU DL project"}'::jsonb),
-    ('platform', 'Platform', 'Shared infrastructure across all products — CHIRAN, IAD, agent architecture',
-     '{"scope": "chiran, iad-governance, agent-platform, shared-sdlc"}'::jsonb)
-ON CONFLICT (id) DO NOTHING;
+-- Seed default projects if not exist (idempotent)
+-- After Phase A migration, projects.owner_profile_id is NOT NULL. Same
+-- branching as MIGRATION_SQL: post-Phase-A path includes owner_profile_id,
+-- legacy / fresh-install path keeps the original four-column insert.
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM information_schema.columns
+               WHERE table_name = 'projects' AND column_name = 'owner_profile_id') THEN
+        IF EXISTS (SELECT 1 FROM profiles WHERE slug = 'mano') THEN
+            INSERT INTO projects (id, name, description, metadata, owner_profile_id) VALUES
+                ('fono', 'Fono', 'AI Voice Assistant for South Indian Telugu restaurants in California',
+                 '{"repo": "manonag/fono-backend", "frontend": "manonag/fono-frontend", "stack": "FastAPI + PostgreSQL + Twilio + Railway"}'::jsonb,
+                 (SELECT profile_id FROM profiles WHERE slug = 'mano')),
+                ('salespilot', 'SalesPilot', 'Field sales route optimization with ML-predicted deal priority scoring',
+                 '{"repo": "planned", "stack": "FastAPI + PostgreSQL + XGBoost + OR-Tools", "context": "Kanaka SJSU DL project"}'::jsonb,
+                 (SELECT profile_id FROM profiles WHERE slug = 'mano')),
+                ('platform', 'Platform', 'Shared infrastructure across all products — CHIRAN, IAD, agent architecture',
+                 '{"scope": "chiran, iad-governance, agent-platform, shared-sdlc"}'::jsonb,
+                 (SELECT profile_id FROM profiles WHERE slug = 'mano'))
+            ON CONFLICT (id) DO NOTHING;
+        END IF;
+    ELSE
+        INSERT INTO projects (id, name, description, metadata) VALUES
+            ('fono', 'Fono', 'AI Voice Assistant for South Indian Telugu restaurants in California',
+             '{"repo": "manonag/fono-backend", "frontend": "manonag/fono-frontend", "stack": "FastAPI + PostgreSQL + Twilio + Railway"}'::jsonb),
+            ('salespilot', 'SalesPilot', 'Field sales route optimization with ML-predicted deal priority scoring',
+             '{"repo": "planned", "stack": "FastAPI + PostgreSQL + XGBoost + OR-Tools", "context": "Kanaka SJSU DL project"}'::jsonb),
+            ('platform', 'Platform', 'Shared infrastructure across all products — CHIRAN, IAD, agent architecture',
+             '{"scope": "chiran, iad-governance, agent-platform, shared-sdlc"}'::jsonb)
+        ON CONFLICT (id) DO NOTHING;
+    END IF;
+END $$;
 
 -- 1. DEPLOYMENT STATE: What's actually running in production
 CREATE TABLE IF NOT EXISTS deployment_state (
