@@ -351,12 +351,31 @@ BEGIN
         );
     END IF;
     
-    -- Seed default projects
-    INSERT INTO projects (id, name, description) VALUES
-        ('fono', 'Fono', 'AI Voice Assistant for Telugu restaurants'),
-        ('salespilot', 'SalesPilot', 'Field sales route optimization'),
-        ('platform', 'Platform', 'Shared infrastructure — CHIRAN, IAD, agent architecture')
-    ON CONFLICT (id) DO NOTHING;
+    -- Seed default projects (idempotent)
+    -- After Phase A migration, projects.owner_profile_id is NOT NULL. Branch
+    -- so post-Phase-A installs (column present, profiles+mano seeded) and
+    -- legacy / fresh-install paths (column not yet present) both succeed.
+    -- ON CONFLICT DO NOTHING preserves owner_profile_id values backfilled by
+    -- Phase A on existing rows.
+    IF EXISTS (SELECT 1 FROM information_schema.columns
+               WHERE table_name = 'projects' AND column_name = 'owner_profile_id') THEN
+        IF EXISTS (SELECT 1 FROM profiles WHERE slug = 'mano') THEN
+            INSERT INTO projects (id, name, description, owner_profile_id) VALUES
+                ('fono', 'Fono', 'AI Voice Assistant for Telugu restaurants',
+                 (SELECT profile_id FROM profiles WHERE slug = 'mano')),
+                ('salespilot', 'SalesPilot', 'Field sales route optimization',
+                 (SELECT profile_id FROM profiles WHERE slug = 'mano')),
+                ('platform', 'Platform', 'Shared infrastructure — CHIRAN, IAD, agent architecture',
+                 (SELECT profile_id FROM profiles WHERE slug = 'mano'))
+            ON CONFLICT (id) DO NOTHING;
+        END IF;
+    ELSE
+        INSERT INTO projects (id, name, description) VALUES
+            ('fono', 'Fono', 'AI Voice Assistant for Telugu restaurants'),
+            ('salespilot', 'SalesPilot', 'Field sales route optimization'),
+            ('platform', 'Platform', 'Shared infrastructure — CHIRAN, IAD, agent architecture')
+        ON CONFLICT (id) DO NOTHING;
+    END IF;
 
     -- Add project column to each table if missing, default to 'fono'
     IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='deployment_state' AND column_name='project') THEN
