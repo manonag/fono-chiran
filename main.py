@@ -1106,8 +1106,27 @@ try:
             return f"Error listing projects: {e}"
 
     @mcp_server.tool()
-    async def create_project(slug: str, name: str, description: str = "", metadata: str = "{}") -> str:
-        """Register a new project in CHIRAN. slug is the unique ID (lowercase, no spaces), name is display name, metadata is optional JSON."""
+    async def create_project(
+        slug: str,
+        name: str,
+        description: str = "",
+        metadata: str = "{}",
+        owner_profile_slug: str = "mano",
+        collaborator_profile_slugs: list[str] | None = None,
+    ) -> str:
+        """Register a new project in CHIRAN.
+
+        Args:
+            slug: unique project ID (lowercase, no spaces).
+            name: display name.
+            description: short description.
+            metadata: JSON string of arbitrary metadata.
+            owner_profile_slug: profile slug of the owner (default 'mano'). Must
+                exist in the profiles table; phase A made owner_profile_id NOT NULL.
+            collaborator_profile_slugs: list of profile slugs (strings) stored as
+                jsonb in the collaborator_profile_ids column. Per AF-225 the
+                column holds slugs, not integer profile_ids.
+        """
         try:
             pool = await _get_pool()
             slug_clean = slug.lower().strip()
@@ -1119,11 +1138,49 @@ try:
                 parsed_meta = {}
             if not isinstance(parsed_meta, dict):
                 parsed_meta = {}
+
+            owner_slug_clean = (owner_profile_slug or "").strip().lower()
+            if not owner_slug_clean:
+                return "Error: owner_profile_slug cannot be empty."
+            owner_row = await pool.fetchrow(
+                "SELECT profile_id FROM profiles WHERE slug = $1",
+                owner_slug_clean,
+            )
+            if owner_row is None:
+                return f"Error: owner profile not found for slug '{owner_slug_clean}'."
+            owner_id = owner_row["profile_id"]
+
+            collab_slugs = collaborator_profile_slugs or []
+            if not isinstance(collab_slugs, list):
+                return "Error: collaborator_profile_slugs must be a list of strings."
+            collab_clean: list[str] = []
+            for s in collab_slugs:
+                if not isinstance(s, str):
+                    return "Error: collaborator_profile_slugs must contain strings only."
+                cs = s.strip().lower()
+                if not cs:
+                    continue
+                exists = await pool.fetchrow(
+                    "SELECT 1 FROM profiles WHERE slug = $1",
+                    cs,
+                )
+                if exists is None:
+                    return f"Error: collaborator profile not found for slug '{cs}'."
+                collab_clean.append(cs)
+
             await pool.execute("""
-                INSERT INTO projects (id, name, description, metadata)
-                VALUES ($1, $2, $3, $4::jsonb)
-            """, slug_clean, name.strip(), description.strip(), json.dumps(parsed_meta))
-            return f"Project registered: {slug_clean} ({name}) — {description}"
+                INSERT INTO projects (id, name, description, metadata, owner_profile_id, collaborator_profile_ids)
+                VALUES ($1, $2, $3, $4::jsonb, $5, $6::jsonb)
+            """,
+                slug_clean,
+                name.strip(),
+                description.strip(),
+                json.dumps(parsed_meta),
+                owner_id,
+                json.dumps(collab_clean),
+            )
+            collab_note = f", collaborators={collab_clean}" if collab_clean else ""
+            return f"Project registered: {slug_clean} ({name}), owner={owner_slug_clean}{collab_note}"
         except asyncpg.UniqueViolationError:
             return f"Project '{slug}' already exists. Use a different slug."
         except Exception as e:
@@ -2595,7 +2652,7 @@ async def seed_current_state(pool: asyncpg.Pool = Depends(get_db)):
     # --- Deployments ---
     deployments = [
         ("data-collection-pipeline", "deployed", "production", "phase0-step2",
-         {"phone": "+18557793783", "storage": "cloudflare-r2", "notifications": "whatsapp",
+         {"phone": "+12094376888", "storage": "cloudflare-r2", "notifications": "whatsapp",
           "voice": "elevenlabs-zara-prerecorded", "secrets": "doppler"}),
         ("api-service", "deployed", "production", "phase0-step2",
          {"features": "dashboard-apis, sse-events, jwt-middleware, event-bus",
@@ -2727,7 +2784,7 @@ async def seed_current_state(pool: asyncpg.Pool = Depends(get_db)):
          {"prompts": 5, "delivers": "Immutable audit chain across all agents"},
          {"format": "PDF", "pages": "10", "version": "1.0", "audience": "developer, claude_code", "filename": "VoiceOrder_IAD_ClaudeCode_Brief_DEV002_v1.0.pdf", "description": "5 paste-ready prompts for Claude Code to build IAD Audit Agent."}),
         ("DATA-001", "document", "Data Collection Pipeline v3.2",
-         {"pipeline": "live", "phone": "+18557793783"},
+         {"pipeline": "live", "phone": "+12094376888"},
          {"format": "PDF", "pages": "?", "version": "3.2", "audience": "developer", "filename": "Data_Collection_Pipeline_v3_2.pdf", "description": "Data collection pipeline design and implementation guide."}),
     ]
     
