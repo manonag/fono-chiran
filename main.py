@@ -1186,6 +1186,122 @@ try:
         except Exception as e:
             return f"Error creating project: {e}"
 
+    # Tables with a project FK. Order matters for cascade: doc_nodes last among
+    # doc tables so doc_edges/doc_versions cascade naturally via ON DELETE CASCADE.
+    _PROJECT_FK_TABLES = (
+        "tasks",
+        "sprint_items",
+        "decisions",
+        "architecture_facts",
+        "principles",
+        "sessions",
+        "open_questions",
+        "deployment_state",
+        "code_state",
+        "doc_staleness",
+        "doc_nodes",
+        "cost_events",
+    )
+    _PROTECTED_PROJECTS = ("chiran", "platform")
+
+    @mcp_server.tool()
+    async def delete_project(slug: str, cascade: bool = False) -> str:
+        """Delete a project. By default refuses if any dependents exist; pass cascade=True to remove dependents in the same transaction.
+
+        Args:
+            slug: project ID to delete.
+            cascade: when True, delete all rows in dependent tables before removing the project.
+
+        Refuses to delete protected projects (chiran, platform) even with no dependents.
+        """
+        try:
+            pool = await _get_pool()
+            slug_clean = (slug or "").strip().lower()
+            if not slug_clean:
+                return "Error: slug cannot be empty."
+
+            if slug_clean in _PROTECTED_PROJECTS:
+                return f"Error: project '{slug_clean}' is protected and cannot be deleted."
+
+            row = await pool.fetchrow("SELECT id FROM projects WHERE id = $1", slug_clean)
+            if row is None:
+                return f"Error: project not found for slug '{slug_clean}'."
+
+            counts: dict[str, int] = {}
+            for table in _PROJECT_FK_TABLES:
+                n = await pool.fetchval(
+                    f"SELECT count(*) FROM {table} WHERE project = $1",
+                    slug_clean,
+                )
+                if n:
+                    counts[table] = int(n)
+
+            if counts and not cascade:
+                listing = ", ".join(f"{n} {t}" for t, n in counts.items())
+                return (
+                    f"Cannot delete project '{slug_clean}': has {listing}. "
+                    f"Use cascade=True to delete all dependents, or reassign them first."
+                )
+
+            deleted = {f"{table}_deleted": 0 for table in _PROJECT_FK_TABLES}
+            async with pool.acquire() as conn:
+                async with conn.transaction():
+                    if cascade:
+                        for table in _PROJECT_FK_TABLES:
+                            result = await conn.execute(
+                                f"DELETE FROM {table} WHERE project = $1",
+                                slug_clean,
+                            )
+                            try:
+                                deleted[f"{table}_deleted"] = int(result.split()[-1])
+                            except (ValueError, IndexError):
+                                deleted[f"{table}_deleted"] = 0
+                    proj_result = await conn.execute(
+                        "DELETE FROM projects WHERE id = $1",
+                        slug_clean,
+                    )
+                    try:
+                        project_rows_deleted = int(proj_result.split()[-1])
+                    except (ValueError, IndexError):
+                        project_rows_deleted = 0
+
+                    audit_exists = await conn.fetchval(
+                        "SELECT 1 FROM information_schema.tables WHERE table_name = 'audit_log'"
+                    )
+                    if audit_exists:
+                        try:
+                            await conn.execute(
+                                """
+                                INSERT INTO audit_log (action, target, details)
+                                VALUES ($1, $2, $3::jsonb)
+                                """,
+                                "project_deleted",
+                                slug_clean,
+                                json.dumps({
+                                    "cascade": bool(cascade),
+                                    "dependent_counts": counts,
+                                }),
+                            )
+                        except Exception:
+                            pass
+
+            summary = {"project": slug_clean, "project_rows_deleted": project_rows_deleted}
+            if cascade:
+                summary.update({k: v for k, v in deleted.items() if v})
+            else:
+                summary["dependents_found"] = 0
+
+            parts = [f"Project '{slug_clean}' deleted."]
+            if cascade and any(v for v in deleted.values()):
+                detail = ", ".join(
+                    f"{v} {k.replace('_deleted', '')}"
+                    for k, v in deleted.items() if v
+                )
+                parts.append(f"Cascaded: {detail}.")
+            return " ".join(parts) + f" Summary: {json.dumps(summary)}"
+        except Exception as e:
+            return f"Error deleting project: {e}"
+
     # ── PRINCIPLES MCP TOOLS ─────────────────────────────────────────────────
 
     @mcp_server.tool()
@@ -1449,10 +1565,11 @@ try:
             return f"Error listing tasks: {e}"
 
     @mcp_server.tool()
-    async def update_task(task_id: int, status: str = "", result: str = "", error: str = "", brief: str = "", priority: int = 0, blocked_reason: str = "", verification_method: str = "", verification_evidence: str = "") -> str:
+    async def update_task(task_id: int, status: str = "", result: str = "", error: str = "", brief: str = "", priority: int = 0, blocked_reason: str = "", verification_method: str = "", verification_evidence: str = "", project: str = "") -> str:
         """Update a task's status, result, or other fields. task_id is the integer ID (e.g. 9 for T-9).
         Status values: draft, ready, approved, in_progress, running, blocked, done, done_unverified, failed, cancelled.
-        Use done_unverified when work is complete but not yet verified. Set verification_method and verification_evidence when marking done."""
+        Use done_unverified when work is complete but not yet verified. Set verification_method and verification_evidence when marking done.
+        project: optional slug to reassign the task to a different project. Empty string preserves current project."""
         try:
             pool = await _get_pool()
             tid = int(task_id)
@@ -1510,11 +1627,21 @@ try:
                 params.append(verification_evidence)
                 idx += 1
 
+            new_project = ""
+            if project and project.strip():
+                new_project = project.strip().lower()
+                exists = await pool.fetchrow("SELECT 1 FROM projects WHERE id = $1", new_project)
+                if exists is None:
+                    return f"Error: project not found for slug '{new_project}'."
+                sets.append(f"project = ${idx}")
+                params.append(new_project)
+                idx += 1
+
             params.append(tid)
-            query = f"UPDATE tasks SET {', '.join(sets)} WHERE id = ${idx} RETURNING id, title, status, result"
+            query = f"UPDATE tasks SET {', '.join(sets)} WHERE id = ${idx} RETURNING id, title, status, result, project"
             row = await pool.fetchrow(query, *params)
 
-            parts = [f"[{task['project']}] Task T-{row['id']} updated:"]
+            parts = [f"[{row['project']}] Task T-{row['id']} updated:"]
             if status:
                 parts.append(f"status -> {status}")
             if result:
@@ -1531,6 +1658,8 @@ try:
                 parts.append(f"verification: {verification_method}")
             if verification_evidence:
                 parts.append(f"evidence: {verification_evidence[:80]}")
+            if new_project:
+                parts.append(f"project: {task['project']} -> {new_project}")
 
             return ", ".join(parts)
         except Exception as e:
@@ -1606,7 +1735,7 @@ EXPECTED_MCP_TOOLS = [
     "generate_handoff", "save_session", "record_decision", "list_decisions",
     "list_sprint", "create_sprint_item", "update_sprint_item", "delete_sprint_item",
     "list_deployments", "list_open_questions", "search_docs", "get_doc_manifest",
-    "list_projects", "create_project",
+    "list_projects", "create_project", "delete_project",
     "add_principle", "list_principles", "retire_principle",
     "add_architecture_fact", "list_architecture_facts", "update_architecture_fact",
     "create_task", "list_tasks", "update_task", "claim_task", "heartbeat_task",
