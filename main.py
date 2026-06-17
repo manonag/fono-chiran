@@ -1666,6 +1666,44 @@ try:
             return f"Error updating task: {e}"
 
     @mcp_server.tool()
+    async def get_task(task_id: int) -> str:
+        """Read one task by integer ID. Returns all fields including the full untruncated brief."""
+        try:
+            pool = await _get_pool()
+            tid = int(task_id)
+            row = await pool.fetchrow("SELECT * FROM tasks WHERE id = $1", tid)
+            if not row:
+                return f"Task T-{tid} not found."
+            t = dict(row)
+
+            # Header, then every field. Unlike list_tasks/generate_handoff this does
+            # NOT truncate — the brief is returned in full with newlines preserved.
+            lines = [f"Task T-{t['id']} [{t.get('project')}] — {t.get('title')}", ""]
+            # Known fields in a readable order; `brief` is rendered last (multi-line).
+            field_order = [
+                "status", "priority", "assigned_to", "created_by", "depends_on",
+                "blocked_reason", "verification_method", "verification_evidence",
+                "result", "error", "session_id", "last_heartbeat",
+                "created_at", "started_at", "completed_at", "updated_at",
+            ]
+            shown = {"id", "project", "title", "brief"}
+            for k in field_order:
+                if k in t:
+                    shown.add(k)
+                    lines.append(f"{k}: {t[k]}")
+            # Any remaining columns not explicitly ordered (future-proof: full set).
+            for k, v in t.items():
+                if k not in shown:
+                    lines.append(f"{k}: {v}")
+
+            lines.append("")
+            lines.append("brief:")
+            lines.append(t.get("brief") or "(empty)")
+            return "\n".join(lines)
+        except Exception as e:
+            return f"Error reading task: {e}"
+
+    @mcp_server.tool()
     async def claim_task(task_id: int, session_id: str) -> str:
         """Claim a task for the current session. Sets status to in_progress, records session_id and started_at.
         Fails if task is already claimed by another session (unless stale — no heartbeat for 30+ min)."""
@@ -1738,7 +1776,7 @@ EXPECTED_MCP_TOOLS = [
     "list_projects", "create_project", "delete_project",
     "add_principle", "list_principles", "retire_principle",
     "add_architecture_fact", "list_architecture_facts", "update_architecture_fact",
-    "create_task", "list_tasks", "update_task", "claim_task", "heartbeat_task",
+    "create_task", "list_tasks", "get_task", "update_task", "claim_task", "heartbeat_task",
 ]
 
 @app.get("/health")
@@ -2142,6 +2180,28 @@ def _build_handoff_document(
 
 # =============================================================================
 # DEPLOYMENT STATE ENDPOINTS
+# =============================================================================
+
+# =============================================================================
+# TASK ENDPOINTS
+# =============================================================================
+
+@app.get("/api/v1/tasks/{task_id}")
+async def get_task_by_id(
+    task_id: int,
+    pool: asyncpg.Pool = Depends(get_db),
+):
+    """Read one task by integer ID. Returns every column with the brief field
+    returned in full (no truncation — that is a list/handoff display concern only).
+    Read sibling of update_task."""
+    row = await pool.fetchrow("SELECT * FROM tasks WHERE id = $1", task_id)
+    if not row:
+        raise HTTPException(404, f"Task T-{task_id} not found")
+    return dict(row)
+
+
+# =============================================================================
+# DEPLOYMENT ENDPOINTS
 # =============================================================================
 
 @app.get("/api/v1/deployments", response_model=list[DeploymentOut])
