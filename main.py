@@ -2494,6 +2494,7 @@ async def resolve_question(
 # --- Pydantic Models ---
 class DocNodeCreate(BaseModel):
     doc_id: str = Field(..., examples=["ARCH-008"])
+    project: str = Field(default="fono", examples=["fono", "swaram", "salespilot"])
     type: str = Field(default="document", examples=["document", "section", "schema", "agent", "technology"])
     name: str = Field(..., examples=["Agent Platform & Division Architecture v1.0"])
     content: dict = Field(default_factory=dict)
@@ -2606,11 +2607,11 @@ async def create_doc_node(
 ):
     """Create a document node in the knowledge graph."""
     row = await pool.fetchrow("""
-        INSERT INTO doc_nodes (doc_id, type, name, content, metadata, status)
-        VALUES ($1, $2, $3, $4::jsonb, $5::jsonb, $6)
+        INSERT INTO doc_nodes (doc_id, type, name, content, metadata, status, project)
+        VALUES ($1, $2, $3, $4::jsonb, $5::jsonb, $6, $7)
         RETURNING *
     """, body.doc_id, body.type, body.name, json.dumps(body.content),
-        json.dumps(body.metadata), body.status)
+        json.dumps(body.metadata), body.status, body.project)
     return dict(row)
 
 
